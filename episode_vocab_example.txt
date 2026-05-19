@@ -1,0 +1,5 @@
+лікар - doctor
+аптека - pharmacy
+температура - temperature
+болить голова - I have a headache
+одужувати - to recover

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+# Local/generated pipeline artifacts
+audio/
+transcripts/
+anki_vocab.csv
+anki_from_transcript.csv
+local_test_anki.csv
+
+# Podcast audio files can be re-downloaded and are too bulky for source control.
+*.mp3
+
+# Local environment files
+.env
+.venv/
+venv/
