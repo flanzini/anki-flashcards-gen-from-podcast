@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -35,11 +36,17 @@ from podcast_to_anki import DEFAULT_RSS_URL, Episode, fetch_text, parse_rss
 USER_AGENT = "Mozilla/5.0 (compatible; episode-to-anki/1.0)"
 CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 SPACES_RE = re.compile(r"\s+")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+|\n+")
 DEFAULT_TEXT_MODEL = "gpt-4o-mini"
 DEFAULT_TRANSCRIPTION_MODEL = "whisper-1"
 DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "medium"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+DEFAULT_OLLAMA_TIMEOUT = 900
+DEFAULT_BATCH_CHARS = 5000
+DEFAULT_CARDS_PER_BATCH = 10
+
+LOGGER = logging.getLogger("episode_to_anki")
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,7 @@ class VocabCard:
     tags: str
     source: str
     episode: str
+    note: str = ""
 
 
 def select_episode(
@@ -77,6 +85,7 @@ def safe_filename(value: str, suffix: str) -> str:
 
 def download_file(url: str, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Downloading %s -> %s", url, output_path)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=60) as response:
         with output_path.open("wb") as output_file:
@@ -109,6 +118,7 @@ def transcribe_openai(audio_path: Path, *, model: str) -> str:
         method="POST",
     )
     try:
+        LOGGER.info("Requesting OpenAI transcription with model=%s", model)
         with urllib.request.urlopen(request, timeout=300) as response:
             return response.read().decode("utf-8", errors="replace").strip()
     except urllib.error.HTTPError as exc:
@@ -162,6 +172,7 @@ def transcribe_whisper_cli(audio_path: Path, *, output_dir: Path, model: str) ->
         "--output_dir",
         str(output_dir),
     ]
+    LOGGER.info("Running Whisper CLI transcription with model=%s", model)
     subprocess.run(command, check=True)
     transcript_path = output_dir / f"{audio_path.stem}.txt"
     if not transcript_path.exists():
@@ -178,15 +189,31 @@ def transcribe_faster_whisper(audio_path: Path, *, model: str) -> str:
             'conda run -n expenses pip install faster-whisper'
         ) from exc
 
+    LOGGER.info("Loading faster-whisper model=%s on CPU with int8 compute", model)
     whisper = WhisperModel(model, device="cpu", compute_type="int8")
+    LOGGER.info("Starting faster-whisper transcription for %s", audio_path)
     segments, info = whisper.transcribe(
         str(audio_path),
         language="uk",
         beam_size=5,
         vad_filter=True,
     )
-    print(f"Detected language: {info.language} ({info.language_probability:.2f})")
-    return "\n".join(clean_text(segment.text) for segment in segments if clean_text(segment.text))
+    LOGGER.info("Detected language: %s (%.2f)", info.language, info.language_probability)
+
+    lines: List[str] = []
+    last_reported = -1
+    for segment in segments:
+        text = clean_text(segment.text)
+        if not text:
+            continue
+        lines.append(text)
+        current_minute = int(segment.end // 60)
+        if current_minute != last_reported:
+            LOGGER.info("Transcribed through %.1f minutes", segment.end / 60)
+            last_reported = current_minute
+
+    LOGGER.info("Finished transcription with %d text segments", len(lines))
+    return "\n".join(lines)
 
 
 def transcribe_audio(
@@ -260,8 +287,16 @@ def extract_vocab_ollama(
     episode: str,
     source: str,
     url: str,
+    timeout: int,
 ) -> List[VocabCard]:
     prompt = build_vocab_prompt(transcript, max_cards=max_cards)
+    LOGGER.info(
+        "Requesting Ollama vocabulary extraction: model=%s chars=%d max_cards=%d timeout=%ss",
+        model,
+        len(transcript),
+        max_cards,
+        timeout,
+    )
     payload = {
         "model": model,
         "prompt": (
@@ -284,7 +319,7 @@ def extract_vocab_ollama(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=300) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise RuntimeError(
@@ -295,7 +330,9 @@ def extract_vocab_ollama(
     content = data.get("response") or data.get("thinking") or ""
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError(f"Ollama returned no response: {data}")
-    return cards_from_json_text(content, source=source, episode=episode)
+    cards = cards_from_json_text(content, source=source, episode=episode)
+    LOGGER.info("Ollama returned %d usable cards", len(cards))
+    return cards
 
 
 def extract_vocab(
@@ -307,6 +344,7 @@ def extract_vocab(
     episode: str,
     source: str,
     ollama_url: str,
+    ollama_timeout: int,
 ) -> List[VocabCard]:
     if provider == "openai":
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -328,8 +366,254 @@ def extract_vocab(
             episode=episode,
             source=source,
             url=ollama_url,
+            timeout=ollama_timeout,
         )
     raise ValueError(f"Unknown vocabulary provider: {provider}")
+
+
+def extract_vocab_batched(
+    transcript: str,
+    *,
+    provider: str,
+    model: str,
+    max_cards: int,
+    cards_per_batch: int,
+    batch_chars: int,
+    episode: str,
+    source: str,
+    ollama_url: str,
+    ollama_timeout: int,
+    checkpoint_output: Optional[Path] = None,
+    card_format: str = "fields",
+) -> List[VocabCard]:
+    batches = split_transcript(transcript, max_chars=batch_chars)
+    if not batches:
+        return []
+
+    LOGGER.info(
+        "Extracting vocabulary in %d batch(es), batch_chars=%d, cards_per_batch=%d, total_limit=%d",
+        len(batches),
+        batch_chars,
+        cards_per_batch,
+        max_cards,
+    )
+    all_cards: List[VocabCard] = []
+    seen = set()
+
+    for index, batch in enumerate(batches, start=1):
+        remaining = max_cards - len(all_cards)
+        if remaining <= 0:
+            LOGGER.info("Reached max card limit (%d); skipping remaining batches", max_cards)
+            break
+
+        batch_limit = min(cards_per_batch, remaining)
+        LOGGER.info(
+            "Batch %d/%d: extracting up to %d cards from %d chars",
+            index,
+            len(batches),
+            batch_limit,
+            len(batch),
+        )
+        batch_cards = extract_vocab(
+            batch,
+            provider=provider,
+            model=model,
+            max_cards=batch_limit,
+            episode=episode,
+            source=source,
+            ollama_url=ollama_url,
+            ollama_timeout=ollama_timeout,
+        )
+
+        added = 0
+        for card in batch_cards:
+            key = card.ukrainian.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            all_cards.append(card)
+            added += 1
+
+        LOGGER.info(
+            "Batch %d/%d complete: %d new cards, %d total",
+            index,
+            len(batches),
+            added,
+            len(all_cards),
+        )
+        if checkpoint_output:
+            count = write_cards(all_cards, checkpoint_output, card_format=card_format)
+            LOGGER.info("Checkpoint written: %s (%d cards)", checkpoint_output, count)
+
+    return all_cards
+
+
+def review_cards_ollama(
+    cards: Sequence[VocabCard],
+    *,
+    model: str,
+    url: str,
+    timeout: int,
+    batch_size: int,
+    checkpoint_output: Optional[Path] = None,
+    card_format: str = "fields",
+) -> List[VocabCard]:
+    if not cards:
+        return []
+
+    reviewed: List[VocabCard] = []
+    batches = [list(cards[index : index + batch_size]) for index in range(0, len(cards), batch_size)]
+    LOGGER.info("Reviewing %d vocabulary items in %d batch(es)", len(cards), len(batches))
+
+    for index, batch in enumerate(batches, start=1):
+        LOGGER.info("Review batch %d/%d: %d cards", index, len(batches), len(batch))
+        prompt = build_review_prompt(batch)
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {
+                "temperature": 0.0,
+                "num_ctx": 8192,
+            },
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise RuntimeError("Could not reach Ollama during card review.") from exc
+
+        content = data.get("response") or data.get("thinking") or ""
+        reviewed.extend(reviewed_cards_from_json(content, batch))
+        reviewed = dedupe_cards(reviewed)
+        LOGGER.info("Review batch %d/%d complete: %d kept so far", index, len(batches), len(reviewed))
+        if checkpoint_output:
+            count = write_cards(reviewed, checkpoint_output, card_format=card_format)
+            LOGGER.info("Review checkpoint written: %s (%d rows)", checkpoint_output, count)
+
+    return dedupe_cards(reviewed)
+
+
+def build_review_prompt(cards: Sequence[VocabCard]) -> str:
+    payload = [
+        {
+            "id": index,
+            "ukrainian": card.ukrainian,
+            "english": card.english,
+            "example": card.example,
+        }
+        for index, card in enumerate(cards)
+    ]
+    return (
+        "You are reviewing Ukrainian Anki vocabulary cards for an English-speaking learner.\n"
+        "Return only valid JSON in this exact shape:\n"
+        '{"cards":[{"id":0,"decision":"keep|edit|drop","ukrainian":"...","english":"...","example":"...","note":"..."}]}\n\n'
+        "Review criteria:\n"
+        "- keep only correct, natural, useful Ukrainian vocabulary cards.\n"
+        "- drop ads/outro/social-media/membership cards, URLs, names, malformed transcript artifacts, and transliterated English.\n"
+        "- drop grammar metalanguage unless it is a central lesson term.\n"
+        "- edit inflected forms to dictionary forms when appropriate.\n"
+        "- fix concise English translations.\n"
+        "- keep examples only if they are natural Ukrainian and actually contain or illustrate the term.\n"
+        "- if an example is garbled or irrelevant, set example to an empty string.\n"
+        "- if unsure, drop the card.\n\n"
+        f"Cards to review:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def reviewed_cards_from_json(content: str, original_cards: Sequence[VocabCard]) -> List[VocabCard]:
+    parsed = parse_json_object(content)
+    rows = parsed.get("cards", [])
+    original_by_id = {index: card for index, card in enumerate(original_cards)}
+    reviewed: List[VocabCard] = []
+
+    for row in rows:
+        try:
+            original = original_by_id[int(row.get("id"))]
+        except (TypeError, ValueError, KeyError):
+            continue
+
+        decision = str(row.get("decision", "")).casefold()
+        if decision == "drop":
+            continue
+        if decision not in {"keep", "edit"}:
+            continue
+
+        ukrainian = clean_text(str(row.get("ukrainian") or original.ukrainian))
+        english = clean_text(str(row.get("english") or original.english))
+        example = clean_text(str(row.get("example") or ""))
+        note = clean_text(str(row.get("note") or original.note))
+
+        if not ukrainian or not english or not CYRILLIC_RE.search(ukrainian):
+            continue
+
+        reviewed.append(
+            VocabCard(
+                ukrainian=ukrainian,
+                english=english,
+                example=example,
+                tags=f"{original.tags} reviewed",
+                source=original.source,
+                episode=original.episode,
+                note=note,
+            )
+        )
+
+    return reviewed
+
+
+def dedupe_cards(cards: Iterable[VocabCard]) -> List[VocabCard]:
+    unique: List[VocabCard] = []
+    seen = set()
+    for card in cards:
+        key = card.ukrainian.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(card)
+    return unique
+
+
+def split_transcript(transcript: str, *, max_chars: int) -> List[str]:
+    transcript = transcript.strip()
+    if not transcript:
+        return []
+    if max_chars <= 0 or len(transcript) <= max_chars:
+        return [transcript]
+
+    pieces = [piece.strip() for piece in SENTENCE_SPLIT_RE.split(transcript) if piece.strip()]
+    batches: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    for piece in pieces:
+        piece_len = len(piece) + 1
+        if current and current_len + piece_len > max_chars:
+            batches.append("\n".join(current))
+            current = []
+            current_len = 0
+
+        if piece_len > max_chars:
+            for start in range(0, len(piece), max_chars):
+                chunk = piece[start : start + max_chars].strip()
+                if chunk:
+                    batches.append(chunk)
+            continue
+
+        current.append(piece)
+        current_len += piece_len
+
+    if current:
+        batches.append("\n".join(current))
+    return batches
 
 
 def cards_from_json_text(content: str, *, source: str, episode: str) -> List[VocabCard]:
@@ -354,6 +638,7 @@ def cards_from_json_text(content: str, *, source: str, episode: str) -> List[Voc
                 tags="ukrainian podcast transcript vocab",
                 source=source,
                 episode=episode,
+                note=clean_text(str(row.get("note", ""))),
             )
         )
 
@@ -376,13 +661,20 @@ def build_vocab_prompt(transcript: str, *, max_cards: int) -> str:
     return (
         f"Extract up to {max_cards} Ukrainian vocabulary flashcards from this transcript.\n"
         "Return only JSON in this exact shape:\n"
-        '{"cards":[{"ukrainian":"...","english":"...","example":"..."}]}\n\n'
+        '{"cards":[{"ukrainian":"...","english":"...","example":"...","note":"..."}]}\n\n'
         "Rules:\n"
-        "- ukrainian: one Ukrainian word, lemma, or short phrase from the transcript.\n"
+        "- Extract only useful Ukrainian vocabulary for an English-speaking learner.\n"
+        "- ukrainian: a normal Ukrainian dictionary form, common phrase, or lesson phrase.\n"
         "- english: concise English meaning or translation.\n"
-        "- example: a short Ukrainian example phrase from the transcript when possible.\n"
+        "- example: a short natural Ukrainian example phrase from the transcript when possible.\n"
+        "- note: optional brief usage note, otherwise empty string.\n"
+        "- Prefer food, recipe, cooking, quantity, and core episode-topic vocabulary.\n"
+        "- Prefer lemmas: use готувати, not готувала; цукор, not цукру, unless the inflected form is the teaching point.\n"
+        "- Include grammar terms only if they are central lesson terms, e.g. родовий відмінок.\n"
+        "- Exclude names, URLs, episode titles, intro/outro phrases, ads, membership/social-media language.\n"
+        "- Exclude malformed transcript artifacts, mixed-language fragments, transliterated English, and unnatural phrases.\n"
         "- Avoid duplicate inflected forms unless they teach a distinct phrase.\n"
-        "- Avoid personal names, episode titles, URLs, ads, and grammar metalanguage.\n\n"
+        "- If uncertain about a card, omit it.\n\n"
         f"Transcript:\n{clipped}"
     )
 
@@ -406,8 +698,61 @@ def clean_text(value: str) -> str:
     return SPACES_RE.sub(" ", value).strip(" \"'.,;:()[]{}")
 
 
-def write_cards(cards: Iterable[VocabCard], output_path: Path) -> int:
+def maybe_repair_mojibake(text: str, mode: str) -> str:
+    if mode == "never":
+        return text
+    if mode == "auto" and not looks_mojibaked(text):
+        return text
+
+    repaired = repair_mojibake(text)
+    if repaired != text and cyrillic_score(repaired) > cyrillic_score(text):
+        LOGGER.info(
+            "Repaired likely mojibake transcript text (Cyrillic chars: %d -> %d)",
+            cyrillic_score(text),
+            cyrillic_score(repaired),
+        )
+        return repaired
+
+    if mode == "always":
+        LOGGER.warning("Mojibake repair was requested but did not improve Cyrillic content")
+    return text
+
+
+def looks_mojibaked(text: str) -> bool:
+    sample = text[:5000]
+    mojibake_markers = sample.count("Ð") + sample.count("Ñ") + sample.count("Â")
+    return mojibake_markers > max(5, cyrillic_score(sample))
+
+
+def repair_mojibake(text: str) -> str:
+    try:
+        return text.encode("cp1252", errors="replace").decode("utf-8", errors="replace")
+    except UnicodeError:
+        return text
+
+
+def cyrillic_score(text: str) -> int:
+    return sum(1 for ch in text if CYRILLIC_RE.match(ch))
+
+
+def write_cards(
+    cards: Iterable[VocabCard],
+    output_path: Path,
+    *,
+    card_format: str = "fields",
+) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    cards = list(cards)
+    if card_format == "fields":
+        return write_field_cards(cards, output_path)
+    if card_format == "basic":
+        return write_basic_cards(cards, output_path, include_sentence_cards=False)
+    if card_format == "basic-with-sentences":
+        return write_basic_cards(cards, output_path, include_sentence_cards=True)
+    raise ValueError(f"Unknown card format: {card_format}")
+
+
+def write_field_cards(cards: Iterable[VocabCard], output_path: Path) -> int:
     count = 0
     with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
         writer = csv.writer(output_file)
@@ -420,11 +765,104 @@ def write_cards(cards: Iterable[VocabCard], output_path: Path) -> int:
     return count
 
 
+def write_basic_cards(
+    cards: Iterable[VocabCard],
+    output_path: Path,
+    *,
+    include_sentence_cards: bool,
+) -> int:
+    count = 0
+    with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(["Front", "Back", "Tags", "Source", "Episode", "CardType"])
+        for card in cards:
+            writer.writerow(
+                [
+                    card.ukrainian,
+                    build_vocab_back(card),
+                    card.tags,
+                    card.source,
+                    card.episode,
+                    "vocabulary",
+                ]
+            )
+            count += 1
+
+            if include_sentence_cards and card.example:
+                writer.writerow(
+                    [
+                        highlight_term(card.example, card.ukrainian),
+                        f"{card.ukrainian}<br>{card.english}",
+                        f"{card.tags} sentence",
+                        card.source,
+                        card.episode,
+                        "sentence",
+                    ]
+                )
+                count += 1
+    return count
+
+
+def read_cards_csv(path: Path) -> List[VocabCard]:
+    cards: List[VocabCard] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as input_file:
+        reader = csv.DictReader(input_file)
+        fieldnames = set(reader.fieldnames or [])
+        for row in reader:
+            if "Ukrainian" in fieldnames and "English" in fieldnames:
+                ukrainian = clean_text(row.get("Ukrainian", ""))
+                english = clean_text(row.get("English", ""))
+                example = clean_text(row.get("Example", ""))
+            elif "Front" in fieldnames and "Back" in fieldnames:
+                if row.get("CardType") == "sentence":
+                    continue
+                ukrainian = clean_text(row.get("Front", ""))
+                english, example = split_basic_back(row.get("Back", ""))
+            else:
+                raise ValueError(f"Unsupported CSV columns in {path}: {reader.fieldnames}")
+
+            if not ukrainian or not english:
+                continue
+            cards.append(
+                VocabCard(
+                    ukrainian=ukrainian,
+                    english=english,
+                    example=example,
+                    tags=row.get("Tags", "ukrainian podcast transcript vocab"),
+                    source=row.get("Source", str(path)),
+                    episode=row.get("Episode", path.stem),
+                )
+            )
+    return cards
+
+
+def split_basic_back(value: str) -> tuple[str, str]:
+    parts = value.split("<br><br>", 1)
+    english = clean_text(re.sub(r"<[^>]+>", "", parts[0]))
+    example = clean_text(re.sub(r"<[^>]+>", "", parts[1])) if len(parts) > 1 else ""
+    return english, example
+
+
+def build_vocab_back(card: VocabCard) -> str:
+    if card.example:
+        return f"{card.english}<br><br>{highlight_term(card.example, card.ukrainian)}"
+    return card.english
+
+
+def highlight_term(sentence: str, term: str) -> str:
+    if not sentence or not term:
+        return sentence
+    return re.sub(re.escape(term), f"<b>{term}</b>", sentence, flags=re.IGNORECASE)
+
+
 def read_or_create_transcript(args: argparse.Namespace, episode: Optional[Episode]) -> tuple[str, str, str]:
     if args.transcript_file:
         transcript_path = Path(args.transcript_file)
         episode_name = args.episode_name or transcript_path.stem
-        return transcript_path.read_text(encoding="utf-8-sig"), str(transcript_path), episode_name
+        LOGGER.info("Reading transcript file: %s", transcript_path)
+        transcript = transcript_path.read_text(encoding="utf-8-sig")
+        transcript = maybe_repair_mojibake(transcript, args.repair_mojibake)
+        return transcript, str(transcript_path), episode_name
 
     audio_path = Path(args.audio_file) if args.audio_file else None
     episode_name = args.episode_name or (episode.title if episode else "episode")
@@ -438,22 +876,27 @@ def read_or_create_transcript(args: argparse.Namespace, episode: Optional[Episod
         audio_path = args.audio_dir / safe_filename(episode.title, ".mp3")
         source = episode.link or episode.audio_url
         if not audio_path.exists() or args.force_download:
-            print(f"Downloading audio: {episode.title}")
+            LOGGER.info("Downloading audio for episode: %s", episode.title)
             download_file(episode.audio_url, audio_path)
 
     transcript_path = args.transcript_dir / safe_filename(episode_name, ".txt")
     if transcript_path.exists() and not args.force_transcribe:
-        return transcript_path.read_text(encoding="utf-8-sig"), source, episode_name
+        LOGGER.info("Using cached transcript: %s", transcript_path)
+        transcript = transcript_path.read_text(encoding="utf-8-sig")
+        transcript = maybe_repair_mojibake(transcript, args.repair_mojibake)
+        return transcript, source, episode_name
 
-    print(f"Transcribing audio with {args.transcriber}: {audio_path}")
+    LOGGER.info("Transcribing audio with %s: %s", args.transcriber, audio_path)
     transcript = transcribe_audio(
         audio_path,
         provider=args.transcriber,
         output_dir=args.transcript_dir,
         model=args.transcription_model,
     )
+    transcript = maybe_repair_mojibake(transcript, args.repair_mojibake)
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     transcript_path.write_text(transcript, encoding="utf-8")
+    LOGGER.info("Transcript written: %s (%d chars)", transcript_path, len(transcript))
     return transcript, source, episode_name
 
 
@@ -464,6 +907,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title-search", default="", help="Pick the first RSS episode title containing this text.")
     parser.add_argument("--audio-file", type=Path, help="Use a local audio file instead of RSS download.")
     parser.add_argument("--transcript-file", type=Path, help="Use an existing transcript and skip transcription.")
+    parser.add_argument("--review-input", type=Path, help="Review an existing generated CSV instead of extracting.")
     parser.add_argument("--episode-name", default="", help="Name to store in the Episode CSV column.")
     parser.add_argument("--audio-dir", type=Path, default=Path("audio"), help="Where downloaded audio goes.")
     parser.add_argument(
@@ -471,8 +915,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, default=Path("anki_from_transcript.csv"))
     parser.add_argument("--max-cards", type=int, default=60)
+    parser.add_argument(
+        "--card-format",
+        choices=["fields", "basic", "basic-with-sentences"],
+        default="fields",
+        help=(
+            "fields writes Ukrainian/English/Example columns; basic writes direct Front/Back rows; "
+            "basic-with-sentences also adds a sentence card for each example."
+        ),
+    )
+    parser.add_argument(
+        "--batch-chars",
+        type=int,
+        default=DEFAULT_BATCH_CHARS,
+        help="Approximate transcript characters per vocabulary extraction batch. Use 0 to disable batching.",
+    )
+    parser.add_argument(
+        "--cards-per-batch",
+        type=int,
+        default=DEFAULT_CARDS_PER_BATCH,
+        help="Maximum cards to ask the model for in each batch.",
+    )
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--force-transcribe", action="store_true")
+    parser.add_argument(
+        "--repair-mojibake",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Repair transcripts that look like UTF-8 text decoded as Windows-1252.",
+    )
     parser.add_argument(
         "--transcriber",
         choices=["faster-whisper", "openai", "whisper-cli"],
@@ -499,17 +970,71 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL),
         help="Ollama generate API URL.",
     )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=int(os.environ.get("OLLAMA_TIMEOUT", DEFAULT_OLLAMA_TIMEOUT)),
+        help="Seconds to wait for local Ollama vocabulary generation.",
+    )
+    parser.add_argument("--review-cards", action="store_true", help="Run a second LLM pass to validate/edit/drop cards.")
+    parser.add_argument("--review-batch-size", type=int, default=20, help="Cards per LLM review batch.")
     parser.add_argument("--text-model", default=os.environ.get("OPENAI_TEXT_MODEL", DEFAULT_TEXT_MODEL))
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=os.environ.get("LOG_LEVEL", "INFO"),
+        help="Logging verbosity.",
+    )
+    parser.add_argument("--log-file", type=Path, help="Optional log file path.")
     return parser
+
+
+def configure_logging(level: str, log_file: Optional[Path]) -> None:
+    handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=getattr(logging, level),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=handlers,
+        force=True,
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    configure_logging(args.log_level, args.log_file)
     started = time.time()
 
     try:
+        LOGGER.info("Starting episode-to-Anki pipeline")
+        if args.review_input:
+            vocab_model = args.ollama_model if args.vocab_provider == "ollama" else args.text_model
+            LOGGER.info("Reading cards for review: %s", args.review_input)
+            cards = read_cards_csv(args.review_input)
+            LOGGER.info("Loaded %d vocabulary cards for review", len(cards))
+            if args.vocab_provider != "ollama":
+                raise RuntimeError("--review-input currently supports local Ollama review only.")
+            cards = review_cards_ollama(
+                cards,
+                model=vocab_model,
+                url=args.ollama_url,
+                timeout=args.ollama_timeout,
+                batch_size=args.review_batch_size,
+                checkpoint_output=args.output,
+                card_format=args.card_format,
+            )
+            count = write_cards(cards, args.output, card_format=args.card_format)
+            LOGGER.info("Wrote %d reviewed cards to %s", count, args.output)
+            LOGGER.info("Elapsed: %.1fs", time.time() - started)
+            return 0
+
         episode = None
         if not args.audio_file and not args.transcript_file:
+            LOGGER.info("Fetching RSS feed: %s", args.rss_url)
             episodes = parse_rss(fetch_text(args.rss_url))
             episode = select_episode(
                 episodes,
@@ -521,23 +1046,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.transcription_model = DEFAULT_TRANSCRIPTION_MODEL
 
         transcript, source, episode_name = read_or_create_transcript(args, episode)
+        LOGGER.info("Transcript ready: %d chars", len(transcript))
         vocab_model = args.ollama_model if args.vocab_provider == "ollama" else args.text_model
-        cards = extract_vocab(
-            transcript,
-            provider=args.vocab_provider,
-            model=vocab_model,
-            max_cards=args.max_cards,
-            episode=episode_name,
-            source=source,
-            ollama_url=args.ollama_url,
-        )
-        count = write_cards(cards, args.output)
+        if args.batch_chars and len(transcript) > args.batch_chars:
+            cards = extract_vocab_batched(
+                transcript,
+                provider=args.vocab_provider,
+                model=vocab_model,
+                max_cards=args.max_cards,
+                cards_per_batch=args.cards_per_batch,
+                batch_chars=args.batch_chars,
+                episode=episode_name,
+                source=source,
+                ollama_url=args.ollama_url,
+                ollama_timeout=args.ollama_timeout,
+                checkpoint_output=args.output,
+                card_format=args.card_format,
+            )
+        else:
+            LOGGER.info("Extracting vocabulary in a single request")
+            cards = extract_vocab(
+                transcript,
+                provider=args.vocab_provider,
+                model=vocab_model,
+                max_cards=args.max_cards,
+                episode=episode_name,
+                source=source,
+                ollama_url=args.ollama_url,
+                ollama_timeout=args.ollama_timeout,
+            )
+        if args.review_cards:
+            if args.vocab_provider != "ollama":
+                raise RuntimeError("--review-cards currently supports local Ollama review only.")
+            cards = review_cards_ollama(
+                cards,
+                model=vocab_model,
+                url=args.ollama_url,
+                timeout=args.ollama_timeout,
+                batch_size=args.review_batch_size,
+                checkpoint_output=args.output,
+                card_format=args.card_format,
+            )
+        count = write_cards(cards, args.output, card_format=args.card_format)
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        LOGGER.exception("Pipeline failed: %s", exc)
         return 1
 
-    print(f"Wrote {count} vocabulary cards to {args.output}.")
-    print(f"Elapsed: {time.time() - started:.1f}s")
+    LOGGER.info("Wrote %d vocabulary cards to %s", count, args.output)
+    LOGGER.info("Elapsed: %.1fs", time.time() - started)
     return 0
 
 

@@ -88,6 +88,33 @@ Limit card count:
 --max-cards 30
 ```
 
+Give slower local models more time:
+
+```powershell
+--ollama-timeout 900
+```
+
+Run local extraction in smaller batches:
+
+```powershell
+--batch-chars 4000 --cards-per-batch 8
+```
+
+Show progress and keep a log file:
+
+```powershell
+--log-level INFO --log-file logs\episode_103.log
+```
+
+Resume from the transcript we already generated:
+
+```powershell
+& "C:\Users\filip\Miniconda3\condabin\conda.bat" run -n expenses python episode_to_anki.py --transcript-file transcripts\ULP_3-103.txt --episode-name "ULP 3-103" --output anki_vocab.csv --max-cards 40 --batch-chars 4000 --cards-per-batch 8 --ollama-timeout 900 --log-file logs\episode_103.log
+```
+
+The script writes the output CSV after every completed batch, so an interrupted
+run still leaves partial cards in the output file.
+
 ## Anki Import
 
 The generated CSV columns are:
@@ -105,6 +132,43 @@ In Anki, map:
 
 Review the CSV before importing. Local models are useful, but a quick human pass
 is still worthwhile for language-learning cards.
+
+For direct Anki Basic cards, use:
+
+```powershell
+--card-format basic
+```
+
+For two Basic cards per vocabulary item, one word card and one example-sentence
+card, use:
+
+```powershell
+--card-format basic-with-sentences
+```
+
+That writes:
+
+```text
+Front, Back, Tags, Source, Episode, CardType
+```
+
+## Review / Validate Generated Cards
+
+For better quality, add a second local Ollama review pass:
+
+```powershell
+--review-cards --review-batch-size 20
+```
+
+You can also review an existing generated CSV without retranscribing or
+extracting again:
+
+```powershell
+C:\Users\filip\Miniconda3\envs\expenses\python.exe episode_to_anki.py --review-input anki_vocab_ulp_2_49.csv --output anki_vocab_ulp_2_49_reviewed.csv --card-format basic-with-sentences --ollama-timeout 900 --log-file logs\episode_2_49_review.log
+```
+
+The reviewer asks the local model to drop bad cards, normalize Ukrainian terms
+to useful learner forms, fix concise translations, and remove garbled examples.
 
 ## Optional OpenAI Mode
 
