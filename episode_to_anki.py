@@ -43,6 +43,8 @@ DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "medium"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 DEFAULT_OLLAMA_TIMEOUT = 900
+DEFAULT_OLLAMA_NUM_PREDICT = 2048
+DEFAULT_OLLAMA_RETRIES = 2
 DEFAULT_BATCH_CHARS = 5000
 DEFAULT_CARDS_PER_BATCH = 10
 
@@ -288,14 +290,17 @@ def extract_vocab_ollama(
     source: str,
     url: str,
     timeout: int,
+    num_predict: int,
+    retries: int,
 ) -> List[VocabCard]:
     prompt = build_vocab_prompt(transcript, max_cards=max_cards)
     LOGGER.info(
-        "Requesting Ollama vocabulary extraction: model=%s chars=%d max_cards=%d timeout=%ss",
+        "Requesting Ollama vocabulary extraction: model=%s chars=%d max_cards=%d timeout=%ss num_predict=%d",
         model,
         len(transcript),
         max_cards,
         timeout,
+        num_predict,
     )
     payload = {
         "model": model,
@@ -310,29 +315,47 @@ def extract_vocab_ollama(
         "options": {
             "temperature": 0.1,
             "num_ctx": 8192,
+            "num_predict": num_predict,
         },
     }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            "Could not reach Ollama. Make sure Ollama is installed and running, "
-            f"then pull the model with: ollama pull {model}"
-        ) from exc
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"Ollama vocabulary extraction timed out after {timeout}s. "
+                "Try smaller --batch-chars/--cards-per-batch values or increase --ollama-timeout."
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                "Could not reach Ollama. Make sure Ollama is installed and running, "
+                f"then pull the model with: ollama pull {model}"
+            ) from exc
 
-    content = data.get("response") or data.get("thinking") or ""
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError(f"Ollama returned no response: {data}")
-    cards = cards_from_json_text(content, source=source, episode=episode)
-    LOGGER.info("Ollama returned %d usable cards", len(cards))
-    return cards
+        content = data.get("response") or data.get("thinking") or ""
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(f"Ollama returned no response: {data}")
+        try:
+            cards = cards_from_json_text(content, source=source, episode=episode)
+        except json.JSONDecodeError as exc:
+            if attempt < retries:
+                LOGGER.warning(
+                    "Ollama returned malformed vocabulary JSON; retrying request (%d/%d)",
+                    attempt + 1,
+                    retries,
+                )
+                continue
+            raise RuntimeError("Ollama repeatedly returned malformed JSON during vocabulary extraction.") from exc
+        LOGGER.info("Ollama returned %d usable cards", len(cards))
+        return cards
+    raise RuntimeError("Ollama vocabulary extraction retry loop exited unexpectedly.")
 
 
 def extract_vocab(
@@ -345,6 +368,8 @@ def extract_vocab(
     source: str,
     ollama_url: str,
     ollama_timeout: int,
+    ollama_num_predict: int,
+    ollama_retries: int,
 ) -> List[VocabCard]:
     if provider == "openai":
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -367,6 +392,8 @@ def extract_vocab(
             source=source,
             url=ollama_url,
             timeout=ollama_timeout,
+            num_predict=ollama_num_predict,
+            retries=ollama_retries,
         )
     raise ValueError(f"Unknown vocabulary provider: {provider}")
 
@@ -383,6 +410,10 @@ def extract_vocab_batched(
     source: str,
     ollama_url: str,
     ollama_timeout: int,
+    ollama_num_predict: int,
+    ollama_retries: int,
+    initial_cards: Sequence[VocabCard] = (),
+    resume_after_batch: int = 0,
     checkpoint_output: Optional[Path] = None,
     card_format: str = "fields",
 ) -> List[VocabCard]:
@@ -397,10 +428,19 @@ def extract_vocab_batched(
         cards_per_batch,
         max_cards,
     )
-    all_cards: List[VocabCard] = []
-    seen = set()
+    all_cards = dedupe_cards(initial_cards)
+    seen = {card.ukrainian.casefold() for card in all_cards}
+    if resume_after_batch:
+        LOGGER.info(
+            "Resuming extraction after batch %d with %d checkpointed vocabulary items",
+            resume_after_batch,
+            len(all_cards),
+        )
 
     for index, batch in enumerate(batches, start=1):
+        if index <= resume_after_batch:
+            LOGGER.info("Batch %d/%d already checkpointed; skipping", index, len(batches))
+            continue
         remaining = max_cards - len(all_cards)
         if remaining <= 0:
             LOGGER.info("Reached max card limit (%d); skipping remaining batches", max_cards)
@@ -423,6 +463,8 @@ def extract_vocab_batched(
             source=source,
             ollama_url=ollama_url,
             ollama_timeout=ollama_timeout,
+            ollama_num_predict=ollama_num_predict,
+            ollama_retries=ollama_retries,
         )
 
         added = 0
@@ -444,6 +486,10 @@ def extract_vocab_batched(
         if checkpoint_output:
             count = write_cards(all_cards, checkpoint_output, card_format=card_format)
             LOGGER.info("Checkpoint written: %s (%d cards)", checkpoint_output, count)
+            if card_format == "bidirectional-with-sentences":
+                fields_checkpoint = suffixed_output_path(checkpoint_output, "checkpoint")
+                write_cards(all_cards, fields_checkpoint, card_format="fields")
+                LOGGER.info("Fields checkpoint written for resume: %s", fields_checkpoint)
 
     return all_cards
 
@@ -454,6 +500,8 @@ def review_cards_ollama(
     model: str,
     url: str,
     timeout: int,
+    num_predict: int,
+    retries: int,
     batch_size: int,
     checkpoint_output: Optional[Path] = None,
     card_format: str = "fields",
@@ -477,27 +525,50 @@ def review_cards_ollama(
             "options": {
                 "temperature": 0.0,
                 "num_ctx": 8192,
+                "num_predict": num_predict,
             },
         }
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.URLError as exc:
-            raise RuntimeError("Could not reach Ollama during card review.") from exc
+        for attempt in range(retries + 1):
+            request = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"Ollama card review timed out after {timeout}s. "
+                    "Try a smaller --review-batch-size value or increase --ollama-timeout."
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError("Could not reach Ollama during card review.") from exc
 
-        content = data.get("response") or data.get("thinking") or ""
-        reviewed.extend(reviewed_cards_from_json(content, batch))
+            content = data.get("response") or data.get("thinking") or ""
+            try:
+                batch_reviewed = reviewed_cards_from_json(content, batch)
+            except json.JSONDecodeError as exc:
+                if attempt < retries:
+                    LOGGER.warning(
+                        "Ollama returned malformed review JSON; retrying request (%d/%d)",
+                        attempt + 1,
+                        retries,
+                    )
+                    continue
+                raise RuntimeError("Ollama repeatedly returned malformed JSON during card review.") from exc
+            reviewed.extend(batch_reviewed)
+            break
         reviewed = dedupe_cards(reviewed)
         LOGGER.info("Review batch %d/%d complete: %d kept so far", index, len(batches), len(reviewed))
         if checkpoint_output:
             count = write_cards(reviewed, checkpoint_output, card_format=card_format)
             LOGGER.info("Review checkpoint written: %s (%d rows)", checkpoint_output, count)
+            if card_format == "bidirectional-with-sentences":
+                fields_checkpoint = suffixed_output_path(checkpoint_output, "reviewed_checkpoint")
+                write_cards(reviewed, fields_checkpoint, card_format="fields")
+                LOGGER.info("Fields review checkpoint written for resume: %s", fields_checkpoint)
 
     return dedupe_cards(reviewed)
 
@@ -749,6 +820,8 @@ def write_cards(
         return write_basic_cards(cards, output_path, include_sentence_cards=False)
     if card_format == "basic-with-sentences":
         return write_basic_cards(cards, output_path, include_sentence_cards=True)
+    if card_format == "bidirectional-with-sentences":
+        return write_split_study_cards(cards, output_path)
     raise ValueError(f"Unknown card format: {card_format}")
 
 
@@ -788,11 +861,12 @@ def write_basic_cards(
             )
             count += 1
 
-            if include_sentence_cards and card.example:
+            sentence_front = build_sentence_front(card.example, card.ukrainian)
+            if include_sentence_cards and sentence_front:
                 writer.writerow(
                     [
-                        highlight_term(card.example, card.ukrainian),
-                        f"{card.ukrainian}<br>{card.english}",
+                        sentence_front,
+                        f"{highlight_term(card.example, card.ukrainian)}<br><br>{card.ukrainian} - {card.english}",
                         f"{card.tags} sentence",
                         card.source,
                         card.episode,
@@ -800,6 +874,55 @@ def write_basic_cards(
                     ]
                 )
                 count += 1
+    return count
+
+
+def write_split_study_cards(cards: Iterable[VocabCard], output_path: Path) -> int:
+    cards = list(cards)
+    words_path = suffixed_output_path(output_path, "words")
+    sentences_path = suffixed_output_path(output_path, "sentences")
+    word_count = write_bidirectional_word_cards(cards, words_path)
+    sentence_count = write_sentence_cards(cards, sentences_path)
+    LOGGER.info("Split study files written: %s and %s", words_path, sentences_path)
+    return word_count + sentence_count
+
+
+def suffixed_output_path(output_path: Path, suffix: str) -> Path:
+    file_suffix = output_path.suffix or ".csv"
+    return output_path.with_name(f"{output_path.stem}_{suffix}{file_suffix}")
+
+
+def write_bidirectional_word_cards(cards: Iterable[VocabCard], output_path: Path) -> int:
+    count = 0
+    with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(["Front", "Back", "Tags", "Source", "Episode", "CardType"])
+        for card in cards:
+            writer.writerow([card.ukrainian, card.english, card.tags, card.source, card.episode, "vocabulary"])
+            count += 1
+    return count
+
+
+def write_sentence_cards(cards: Iterable[VocabCard], output_path: Path) -> int:
+    count = 0
+    with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(["Front", "Back", "Tags", "Source", "Episode", "CardType"])
+        for card in cards:
+            sentence_front = build_sentence_front(card.example, card.ukrainian)
+            if not sentence_front:
+                continue
+            writer.writerow(
+                [
+                    sentence_front,
+                    f"{highlight_term(card.example, card.ukrainian)}<br><br>{card.ukrainian} - {card.english}",
+                    f"{card.tags} sentence",
+                    card.source,
+                    card.episode,
+                    "sentence",
+                ]
+            )
+            count += 1
     return count
 
 
@@ -855,6 +978,14 @@ def highlight_term(sentence: str, term: str) -> str:
     return re.sub(re.escape(term), f"<b>{term}</b>", sentence, flags=re.IGNORECASE)
 
 
+def build_sentence_front(sentence: str, term: str) -> str:
+    if not sentence or not term:
+        return ""
+    if not re.search(re.escape(term), sentence, flags=re.IGNORECASE):
+        return ""
+    return re.sub(re.escape(term), "[...]", sentence, count=1, flags=re.IGNORECASE)
+
+
 def read_or_create_transcript(args: argparse.Namespace, episode: Optional[Episode]) -> tuple[str, str, str]:
     if args.transcript_file:
         transcript_path = Path(args.transcript_file)
@@ -908,6 +1039,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-file", type=Path, help="Use a local audio file instead of RSS download.")
     parser.add_argument("--transcript-file", type=Path, help="Use an existing transcript and skip transcription.")
     parser.add_argument("--review-input", type=Path, help="Review an existing generated CSV instead of extracting.")
+    parser.add_argument("--format-input", type=Path, help="Reformat an existing generated CSV without model calls.")
+    parser.add_argument("--resume-input", type=Path, help="Seed extraction from a previously written checkpoint CSV.")
+    parser.add_argument(
+        "--resume-after-batch",
+        type=int,
+        default=0,
+        help="Skip this many completed transcript extraction batches when using --resume-input.",
+    )
     parser.add_argument("--episode-name", default="", help="Name to store in the Episode CSV column.")
     parser.add_argument("--audio-dir", type=Path, default=Path("audio"), help="Where downloaded audio goes.")
     parser.add_argument(
@@ -917,11 +1056,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-cards", type=int, default=60)
     parser.add_argument(
         "--card-format",
-        choices=["fields", "basic", "basic-with-sentences"],
+        choices=["fields", "basic", "basic-with-sentences", "bidirectional-with-sentences"],
         default="fields",
         help=(
             "fields writes Ukrainian/English/Example columns; basic writes direct Front/Back rows; "
-            "basic-with-sentences also adds a sentence card for each example."
+            "basic-with-sentences also adds sentence rows; bidirectional-with-sentences writes separate "
+            "word and fill-the-gap sentence files for different Anki note types."
         ),
     )
     parser.add_argument(
@@ -976,6 +1116,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("OLLAMA_TIMEOUT", DEFAULT_OLLAMA_TIMEOUT)),
         help="Seconds to wait for local Ollama vocabulary generation.",
     )
+    parser.add_argument(
+        "--ollama-num-predict",
+        type=int,
+        default=int(os.environ.get("OLLAMA_NUM_PREDICT", DEFAULT_OLLAMA_NUM_PREDICT)),
+        help="Maximum response tokens generated by Ollama per extraction or review request.",
+    )
+    parser.add_argument(
+        "--ollama-retries",
+        type=int,
+        default=int(os.environ.get("OLLAMA_RETRIES", DEFAULT_OLLAMA_RETRIES)),
+        help="Number of retries when Ollama returns malformed JSON.",
+    )
     parser.add_argument("--review-cards", action="store_true", help="Run a second LLM pass to validate/edit/drop cards.")
     parser.add_argument("--review-batch-size", type=int, default=20, help="Cards per LLM review batch.")
     parser.add_argument("--text-model", default=os.environ.get("OPENAI_TEXT_MODEL", DEFAULT_TEXT_MODEL))
@@ -1011,6 +1163,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         LOGGER.info("Starting episode-to-Anki pipeline")
+        if args.resume_after_batch and not args.resume_input:
+            raise RuntimeError("--resume-after-batch requires --resume-input.")
+        if args.format_input:
+            LOGGER.info("Reading cards for reformatting: %s", args.format_input)
+            cards = read_cards_csv(args.format_input)
+            count = write_cards(cards, args.output, card_format=args.card_format)
+            LOGGER.info("Wrote %d reformatted rows from %s", count, args.format_input)
+            return 0
+
         if args.review_input:
             vocab_model = args.ollama_model if args.vocab_provider == "ollama" else args.text_model
             LOGGER.info("Reading cards for review: %s", args.review_input)
@@ -1023,6 +1184,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 model=vocab_model,
                 url=args.ollama_url,
                 timeout=args.ollama_timeout,
+                num_predict=args.ollama_num_predict,
+                retries=args.ollama_retries,
                 batch_size=args.review_batch_size,
                 checkpoint_output=args.output,
                 card_format=args.card_format,
@@ -1048,6 +1211,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         transcript, source, episode_name = read_or_create_transcript(args, episode)
         LOGGER.info("Transcript ready: %d chars", len(transcript))
         vocab_model = args.ollama_model if args.vocab_provider == "ollama" else args.text_model
+        initial_cards: List[VocabCard] = []
+        if args.resume_input:
+            initial_cards = read_cards_csv(args.resume_input)
+            LOGGER.info("Loaded %d checkpointed vocabulary items from %s", len(initial_cards), args.resume_input)
         if args.batch_chars and len(transcript) > args.batch_chars:
             cards = extract_vocab_batched(
                 transcript,
@@ -1060,10 +1227,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 source=source,
                 ollama_url=args.ollama_url,
                 ollama_timeout=args.ollama_timeout,
+                ollama_num_predict=args.ollama_num_predict,
+                ollama_retries=args.ollama_retries,
+                initial_cards=initial_cards,
+                resume_after_batch=args.resume_after_batch,
                 checkpoint_output=args.output,
                 card_format=args.card_format,
             )
         else:
+            if initial_cards or args.resume_after_batch:
+                raise RuntimeError("--resume-input/--resume-after-batch require batched extraction.")
             LOGGER.info("Extracting vocabulary in a single request")
             cards = extract_vocab(
                 transcript,
@@ -1074,15 +1247,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 source=source,
                 ollama_url=args.ollama_url,
                 ollama_timeout=args.ollama_timeout,
+                ollama_num_predict=args.ollama_num_predict,
+                ollama_retries=args.ollama_retries,
             )
         if args.review_cards:
             if args.vocab_provider != "ollama":
                 raise RuntimeError("--review-cards currently supports local Ollama review only.")
+            extraction_snapshot = suffixed_output_path(args.output, "extracted")
+            extracted_count = write_cards(cards, extraction_snapshot, card_format="fields")
+            LOGGER.info("Extraction snapshot written before review: %s (%d cards)", extraction_snapshot, extracted_count)
             cards = review_cards_ollama(
                 cards,
                 model=vocab_model,
                 url=args.ollama_url,
                 timeout=args.ollama_timeout,
+                num_predict=args.ollama_num_predict,
+                retries=args.ollama_retries,
                 batch_size=args.review_batch_size,
                 checkpoint_output=args.output,
                 card_format=args.card_format,

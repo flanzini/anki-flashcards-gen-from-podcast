@@ -94,6 +94,18 @@ Give slower local models more time:
 --ollama-timeout 900
 ```
 
+Bound long or runaway local-model responses:
+
+```powershell
+--ollama-num-predict 1024
+```
+
+Retry malformed local-model JSON responses:
+
+```powershell
+--ollama-retries 2
+```
+
 Run local extraction in smaller batches:
 
 ```powershell
@@ -146,10 +158,42 @@ card, use:
 --card-format basic-with-sentences
 ```
 
+Import `basic` and `basic-with-sentences` output into Anki using the one-direction
+`Basic` note type, not `Basic (and reversed card)`. Sentence cards show a
+fill-the-gap prompt only when the target term occurs explicitly in the example;
+examples using a different inflected form remain on the vocabulary card but do
+not create an ambiguous sentence prompt.
+
 That writes:
 
 ```text
 Front, Back, Tags, Source, Episode, CardType
+```
+
+For recommended two-direction vocabulary practice plus forward-only sentence
+practice, use:
+
+```powershell
+--card-format bidirectional-with-sentences --output anki_vocab_ulp_2_50.csv
+```
+
+This writes two CSV files:
+
+```text
+anki_vocab_ulp_2_50_words.csv
+anki_vocab_ulp_2_50_sentences.csv
+```
+
+Import `*_words.csv` using Anki's `Basic (and reversed card)` note type. The
+word cards contain only Ukrainian and English, so the English-to-Ukrainian
+prompt does not reveal its answer. Import `*_sentences.csv` using the
+one-direction `Basic` note type; its fronts are Ukrainian fill-the-gap prompts.
+
+To export these two files from an already generated or reviewed CSV without
+calling the model again:
+
+```powershell
+python episode_to_anki.py --format-input reviewed.csv --output anki_vocab_ulp_2_50.csv --card-format bidirectional-with-sentences
 ```
 
 ## Review / Validate Generated Cards
@@ -169,6 +213,15 @@ C:\Users\filip\Miniconda3\envs\expenses\python.exe episode_to_anki.py --review-i
 
 The reviewer asks the local model to drop bad cards, normalize Ukrainian terms
 to useful learner forms, fix concise translations, and remove garbled examples.
+When `--review-cards` is used during extraction, the unreviewed extracted cards
+are also saved to an `_extracted.csv` snapshot before review starts.
+
+If a batched extraction fails after writing a checkpoint, resume from it without
+repeating completed batches:
+
+```powershell
+python episode_to_anki.py --transcript-file transcript.txt --resume-input partial.csv --resume-after-batch 5 --output resumed.csv --batch-chars 1200 --cards-per-batch 6
+```
 
 ## Optional OpenAI Mode
 
