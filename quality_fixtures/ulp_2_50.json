@@ -1,0 +1,26 @@
+{
+  "name": "ULP 2-50 review quality regression fixture",
+  "checks": [
+    {"check": "keep", "ukrainian": "вечеря"},
+    {"check": "keep", "ukrainian": "яйця"},
+    {"check": "keep", "ukrainian": "чимало"},
+    {"check": "keep", "ukrainian": "їсти"},
+    {"check": "keep", "ukrainian": "мексиканське овочеве рагу"},
+    {"check": "exclude", "ukrainian": "їжу"},
+    {"check": "exclude", "ukrainian": "картошка"},
+    {"check": "exclude", "ukrainian": "Ласкаво просимо"},
+    {"check": "exclude", "ukrainian": "На все добре!"},
+    {"check": "english_contains_any", "ukrainian": "сирники", "values": ["cottage cheese", "syrnyky"]},
+    {"check": "english_contains_any", "ukrainian": "філіжанка", "values": ["cup"]},
+    {"check": "exclude", "ukrainian": "вивчаю"},
+    {"check": "keep", "ukrainian": "вивчати"},
+    {"check": "exclude", "ukrainian": "випиваю"},
+    {"check": "exclude", "ukrainian": "гранула"},
+    {"check": "keep", "ukrainian": "гранола"},
+    {"check": "exclude", "ukrainian": "п'ять бутербродів"},
+    {"check": "keep", "ukrainian": "бутерброд"},
+    {"check": "target_not_equals", "ukrainian": "родовий відмінок", "values": ["сирників"]},
+    {"check": "target_not_equals", "ukrainian": "вода", "values": ["п'ю"]},
+    {"check": "target_equals_any", "ukrainian": "овочевий пиріг", "values": ["овочевого пирога"]}
+  ]
+}

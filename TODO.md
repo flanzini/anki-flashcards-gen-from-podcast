@@ -11,25 +11,27 @@
 - [x] Export separate study files:
   - bidirectional vocabulary cards for `Basic (and reversed card)`
   - forward-only fill-the-gap sentence cards for `Basic`
+- [x] Track exact example surface forms for safe sentence gaps, including inflected forms.
+- [x] Generate a validation report for reviewed cards before import.
 
 ## Anki Integration
 
-- [ ] Add AnkiConnect API support for creating and updating cards in local Anki.
+- [x] Add AnkiConnect API support for pushing approved cards into local Anki.
   - Detect whether AnkiConnect is running at `http://127.0.0.1:8765`.
-  - Add CLI flags:
-    - `--push-to-anki`
-    - `--anki-deck "Ukrainian::ULP 2-49"`
-    - `--anki-model "Basic"`
-    - `--anki-update-existing`
+  - Provide `anki_connect.py` for approved split CSVs and a push action in the final browser review UI.
+  - Configure the destination deck with `--deck` or `--anki-deck`.
+  - Document Anki nested-deck naming with `Parent::Child` and the expandable parent display.
+  - Configure separate word/sentence note models and optional updates to managed existing notes.
   - Create the deck if it does not exist.
   - Push reviewed word and sentence cards with their appropriate note models.
-  - Update already-pushed cards when reviewed output changes instead of adding duplicates.
-  - Preserve tags, source, episode, and card type.
+  - Update already-pushed managed cards when reviewed output changes instead of adding duplicates.
+  - Preserve source, episode, and card type as searchable Anki tags when using built-in note models.
   - Fail gracefully if Anki is not open or AnkiConnect is not installed.
   - Document setup:
     - install Anki desktop
     - install the AnkiConnect add-on
     - keep Anki open while pushing cards
+- [ ] Consider matching or migrating cards previously imported manually before managed AnkiConnect tags existed.
 
 ## Card Quality
 
@@ -39,7 +41,31 @@
   - removing malformed transcript artifacts
   - normalizing inflected forms to dictionary forms
   - keeping grammar cards only when they are central to the episode
+- [x] Add deterministic guards against non-Ukrainian examples, invalid sentence targets, and low-context gaps.
 - [ ] Add a `--min-quality` or `--strictness` option for different learner preferences.
+- [x] Validate that `ExampleTarget` plausibly expresses the card headword, not merely a word present in the example.
+  - Use conservative, general rules for safe sentence export; when uncertain, keep only the vocabulary card.
+  - Use ULP 2-50 target mismatches as regression examples, not hardcoded production corrections.
+- [ ] Improve general normalization and translation-quality review for recurring error classes.
+  - Prefer dictionary forms over incidental inflections or quantified phrases when the base term is the learning target.
+  - Flag suspect translation/transcription inconsistencies for review rather than hardcoding episode-specific replacements.
+- [x] Separate local model review responsibilities into usefulness triage and lexical cleanup passes.
+  - Keep sentence-card safety deterministic after model review.
+- [x] Retain useful standalone vocabulary as word cards when examples are too short for sentence practice.
+- [x] Preserve plausible uncertain cards in a `*_needs_review.csv` queue instead of dropping them silently.
+- [x] Add an optional focused recovery pass for cards remaining in the needs-review queue.
+- [ ] Add an independent lexical challenge pass or targeted manual-review rule for accepted cards.
+  - The split-pass `qwen3:4b` probe preserved useful terms but still confidently accepted an unchanged bad translation.
+  - Route suspected translation or lemma uncertainty into `*_needs_review.csv` even when the first lexical pass says accept.
+- [x] Add an episode quality-audit fixture using the observed ULP 2-50 failures.
+  - Treat its individual words and phrases as observed regression cases for general quality behavior.
+- [x] Capture reviewer drop decisions and reasons, and generate a dropped-card audit report before import.
+- [x] Add a local visual interface for final accept/correct/reject validation before Anki import.
+- [ ] Optional: add a targeted OpenAI API final-adjudication pass after local review.
+  - Keep transcription, extraction, deterministic validation, and routine processing local.
+  - Send only the final candidate cards plus rejected-card audit for stronger linguistic judgment.
+  - Evaluate adjudicated output against saved quality fixtures before import.
+  - Keep this optional because API use is billed separately from ChatGPT Pro.
 
 ## Deduplication
 
@@ -63,10 +89,11 @@
 
 ## Repository Organization
 
-- [ ] Reorganize generated artifacts into clear dedicated folders.
-  - Store generated and reviewed CSV exports under a single output folder, such as `outputs/`.
-  - Decide whether checkpoints belong under `outputs/checkpoints/` or a separate transient work folder.
+- [x] Reorganize generated artifacts into clear dedicated folders.
+  - Store generated and reviewed CSV exports under episode folders in `outputs/`.
+  - Keep each episode's checkpoints, review audits, and manual decisions together, with import-ready exports in an episode-level `approved/` folder.
   - Keep logs under `logs/` and transcripts/audio under their existing cache folders.
+  - Use `outputs/misc/` for historical scratch or non-episode CSV exports.
   - Update default paths, documentation, and `.gitignore` rules after the folder convention is chosen.
 - [ ] Create a `legacy/` archive folder for files that are no longer part of the main workflow.
   - Move the exploratory Jupyter notebooks there if they are still worth retaining.

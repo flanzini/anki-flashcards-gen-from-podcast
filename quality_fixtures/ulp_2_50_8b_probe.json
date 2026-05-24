@@ -1,0 +1,11 @@
+{
+  "name": "ULP 2-50 qwen3:8b focused review probe",
+  "checks": [
+    {"check": "keep", "ukrainian": "вечеря"},
+    {"check": "keep", "ukrainian": "чимало"},
+    {"check": "english_contains_any", "ukrainian": "філіжанка", "values": ["cup"]},
+    {"check": "exclude", "ukrainian": "родовий відмінок"},
+    {"check": "target_not_equals", "ukrainian": "вода", "values": ["п'ю"]},
+    {"check": "target_equals_any", "ukrainian": "овочевий пиріг", "values": ["овочевого пирога"]}
+  ]
+}

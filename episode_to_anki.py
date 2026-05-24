@@ -37,6 +37,7 @@ USER_AGENT = "Mozilla/5.0 (compatible; episode-to-anki/1.0)"
 CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 SPACES_RE = re.compile(r"\s+")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+|\n+")
+UKRAINIAN_TOKEN_RE = re.compile(r"[\u0400-\u04ff'’]+")
 DEFAULT_TEXT_MODEL = "gpt-4o-mini"
 DEFAULT_TRANSCRIPTION_MODEL = "whisper-1"
 DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "medium"
@@ -60,6 +61,40 @@ class VocabCard:
     source: str
     episode: str
     note: str = ""
+    example_target: str = ""
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    severity: str
+    code: str
+    ukrainian: str
+    message: str
+
+
+@dataclass(frozen=True)
+class ReviewDisposition:
+    card: VocabCard
+    decision: str
+    reason: str
+    decision_confidence: str = ""
+    translation_confidence: str = ""
+    normalization_confidence: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    accepted: List[VocabCard]
+    needs_review: List[ReviewDisposition]
+    rejected: List[ReviewDisposition]
+
+
+@dataclass(frozen=True)
+class QualityCheckResult:
+    status: str
+    check: str
+    ukrainian: str
+    message: str
 
 
 def select_episode(
@@ -504,76 +539,157 @@ def review_cards_ollama(
     retries: int,
     batch_size: int,
     checkpoint_output: Optional[Path] = None,
+    needs_review_output: Optional[Path] = None,
+    rejected_output: Optional[Path] = None,
+    recover_needs_review: bool = False,
     card_format: str = "fields",
-) -> List[VocabCard]:
+) -> ReviewResult:
     if not cards:
-        return []
+        return ReviewResult([], [], [])
 
-    reviewed: List[VocabCard] = []
+    accepted: List[VocabCard] = []
+    needs_review: List[ReviewDisposition] = []
+    rejected: List[ReviewDisposition] = []
     batches = [list(cards[index : index + batch_size]) for index in range(0, len(cards), batch_size)]
-    LOGGER.info("Reviewing %d vocabulary items in %d batch(es)", len(cards), len(batches))
+    LOGGER.info("Reviewing %d vocabulary items in %d batch(es) using separated passes", len(cards), len(batches))
 
     for index, batch in enumerate(batches, start=1):
-        LOGGER.info("Review batch %d/%d: %d cards", index, len(batches), len(batch))
-        prompt = build_review_prompt(batch)
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-            "think": False,
-            "options": {
-                "temperature": 0.0,
-                "num_ctx": 8192,
-                "num_predict": num_predict,
-            },
-        }
-        for attempt in range(retries + 1):
-            request = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-            except TimeoutError as exc:
-                raise RuntimeError(
-                    f"Ollama card review timed out after {timeout}s. "
-                    "Try a smaller --review-batch-size value or increase --ollama-timeout."
-                ) from exc
-            except urllib.error.URLError as exc:
-                raise RuntimeError("Could not reach Ollama during card review.") from exc
+        LOGGER.info("Selection pass batch %d/%d: %d cards", index, len(batches), len(batch))
+        selection_content = request_ollama_review_json(
+            build_selection_prompt(batch),
+            model=model,
+            url=url,
+            timeout=timeout,
+            num_predict=num_predict,
+            retries=retries,
+            pass_name="selection",
+        )
+        selection = review_decisions_from_json(selection_content, batch, phase="selection")
+        plausible_cards = selection.accepted + [item.card for item in selection.needs_review]
+        rejected.extend(selection.rejected)
 
-            content = data.get("response") or data.get("thinking") or ""
-            try:
-                batch_reviewed = reviewed_cards_from_json(content, batch)
-            except json.JSONDecodeError as exc:
-                if attempt < retries:
-                    LOGGER.warning(
-                        "Ollama returned malformed review JSON; retrying request (%d/%d)",
-                        attempt + 1,
-                        retries,
-                    )
-                    continue
-                raise RuntimeError("Ollama repeatedly returned malformed JSON during card review.") from exc
-            reviewed.extend(batch_reviewed)
-            break
-        reviewed = dedupe_cards(reviewed)
-        LOGGER.info("Review batch %d/%d complete: %d kept so far", index, len(batches), len(reviewed))
+        batch_result = ReviewResult([], [], [])
+        if plausible_cards:
+            LOGGER.info("Lexical pass batch %d/%d: %d plausible cards", index, len(batches), len(plausible_cards))
+            lexical_content = request_ollama_review_json(
+                build_lexical_prompt(plausible_cards),
+                model=model,
+                url=url,
+                timeout=timeout,
+                num_predict=num_predict,
+                retries=retries,
+                pass_name="lexical",
+            )
+            batch_result = review_decisions_from_json(lexical_content, plausible_cards, phase="lexical")
+
+        if recover_needs_review and batch_result.needs_review:
+            pending_cards = [item.card for item in batch_result.needs_review]
+            LOGGER.info("Recovery pass batch %d/%d: %d pending cards", index, len(batches), len(pending_cards))
+            recovery_content = request_ollama_review_json(
+                build_recovery_prompt(batch_result.needs_review),
+                model=model,
+                url=url,
+                timeout=timeout,
+                num_predict=num_predict,
+                retries=retries,
+                pass_name="recovery",
+            )
+            recovery = review_decisions_from_json(recovery_content, pending_cards, phase="lexical")
+            batch_result = ReviewResult(
+                accepted=batch_result.accepted + recovery.accepted,
+                needs_review=recovery.needs_review,
+                rejected=batch_result.rejected + recovery.rejected,
+            )
+
+        accepted.extend(batch_result.accepted)
+        needs_review.extend(batch_result.needs_review)
+        rejected.extend(batch_result.rejected)
+        accepted = dedupe_cards(accepted)
+        needs_review = dedupe_dispositions(needs_review)
+        rejected = dedupe_dispositions(rejected)
+        LOGGER.info(
+            "Review batch %d/%d complete: %d accepted, %d pending, %d rejected so far",
+            index,
+            len(batches),
+            len(accepted),
+            len(needs_review),
+            len(rejected),
+        )
         if checkpoint_output:
-            count = write_cards(reviewed, checkpoint_output, card_format=card_format)
+            count = write_cards(accepted, checkpoint_output, card_format=card_format)
             LOGGER.info("Review checkpoint written: %s (%d rows)", checkpoint_output, count)
             if card_format == "bidirectional-with-sentences":
                 fields_checkpoint = suffixed_output_path(checkpoint_output, "reviewed_checkpoint")
-                write_cards(reviewed, fields_checkpoint, card_format="fields")
+                write_cards(accepted, fields_checkpoint, card_format="fields")
                 LOGGER.info("Fields review checkpoint written for resume: %s", fields_checkpoint)
+        if needs_review_output:
+            pending_count = write_review_dispositions(needs_review, needs_review_output)
+            LOGGER.info("Needs-review audit written: %s (%d rows)", needs_review_output, pending_count)
+        if rejected_output:
+            rejected_count = write_review_dispositions(rejected, rejected_output)
+            LOGGER.info("Rejected-card audit written: %s (%d rows)", rejected_output, rejected_count)
 
-    return dedupe_cards(reviewed)
+    return ReviewResult(dedupe_cards(accepted), dedupe_dispositions(needs_review), dedupe_dispositions(rejected))
 
 
-def build_review_prompt(cards: Sequence[VocabCard]) -> str:
+def request_ollama_review_json(
+    prompt: str,
+    *,
+    model: str,
+    url: str,
+    timeout: int,
+    num_predict: int,
+    retries: int,
+    pass_name: str,
+) -> str:
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "think": False,
+        "options": {
+            "temperature": 0.0,
+            "num_ctx": 8192,
+            "num_predict": num_predict,
+        },
+    }
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"Ollama {pass_name} review timed out after {timeout}s. "
+                "Try a smaller --review-batch-size value or increase --ollama-timeout."
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Could not reach Ollama during {pass_name} review.") from exc
+
+        content = data.get("response") or data.get("thinking") or ""
+        try:
+            parse_json_object(content)
+            return content
+        except json.JSONDecodeError as exc:
+            if attempt < retries:
+                LOGGER.warning(
+                    "Ollama returned malformed %s JSON; retrying request (%d/%d)",
+                    pass_name,
+                    attempt + 1,
+                    retries,
+                )
+                continue
+            raise RuntimeError(f"Ollama repeatedly returned malformed JSON during {pass_name} review.") from exc
+    raise RuntimeError(f"Ollama {pass_name} review did not return a result.")
+
+
+def build_selection_prompt(cards: Sequence[VocabCard]) -> str:
     payload = [
         {
             "id": index,
@@ -584,61 +700,265 @@ def build_review_prompt(cards: Sequence[VocabCard]) -> str:
         for index, card in enumerate(cards)
     ]
     return (
-        "You are reviewing Ukrainian Anki vocabulary cards for an English-speaking learner.\n"
+        "You are triaging candidate Ukrainian vocabulary for an English-speaking learner.\n"
+        "Decide only whether each vocabulary concept is worth retaining; do not correct translations, lemmas, examples, or sentence targets in this pass.\n"
         "Return only valid JSON in this exact shape:\n"
-        '{"cards":[{"id":0,"decision":"keep|edit|drop","ukrainian":"...","english":"...","example":"...","note":"..."}]}\n\n'
-        "Review criteria:\n"
-        "- keep only correct, natural, useful Ukrainian vocabulary cards.\n"
-        "- drop ads/outro/social-media/membership cards, URLs, names, malformed transcript artifacts, and transliterated English.\n"
-        "- drop grammar metalanguage unless it is a central lesson term.\n"
-        "- edit inflected forms to dictionary forms when appropriate.\n"
-        "- fix concise English translations.\n"
-        "- keep examples only if they are natural Ukrainian and actually contain or illustrate the term.\n"
-        "- if an example is garbled or irrelevant, set example to an empty string.\n"
-        "- if unsure, drop the card.\n\n"
-        f"Cards to review:\n{json.dumps(payload, ensure_ascii=False)}"
+        '{"cards":[{"id":0,"d":"a|n|x","c":"h|m|l","r":"..."}]}\n'
+        "Codes: d=a accept, d=n needs_review, d=x reject_high_confidence; c=h high, c=m medium, c=l low. Keep r short.\n\n"
+        "Selection criteria:\n"
+        "- accept plausible useful vocabulary even if its example is missing, short, or unsuitable for a sentence card.\n"
+        "- a standalone word remains a valid vocabulary-only card when its example is only that word or otherwise lacks enough context for a cloze sentence.\n"
+        "- reject_high_confidence only for clear noise such as advertisements, outro/greeting material, URLs, malformed artifacts, or non-Ukrainian transcript noise.\n"
+        "- reject grammar metalanguage when it is merely mentioned incidentally rather than actually taught or explained by the lesson context.\n"
+        "- never reject a plausible food, daily-routine, action, or lesson vocabulary item merely because the example is weak.\n"
+        "- use needs_review for plausible vocabulary whose usefulness is uncertain.\n"
+        "- give a short English reason for needs_review or reject_high_confidence.\n\n"
+        f"Candidate concepts:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
 
-def reviewed_cards_from_json(content: str, original_cards: Sequence[VocabCard]) -> List[VocabCard]:
+def build_lexical_prompt(cards: Sequence[VocabCard]) -> str:
+    payload = [
+        {
+            "id": index,
+            "ukrainian": card.ukrainian,
+            "english": card.english,
+            "example": card.example,
+        }
+        for index, card in enumerate(cards)
+    ]
+    return (
+        "You are cleaning plausible Ukrainian vocabulary cards for an English-speaking learner.\n"
+        "The concepts have already passed usefulness triage. Focus only on lemma normalization, concise English translation, and whether an example target is safe to propose.\n"
+        "Return only valid JSON in this exact shape:\n"
+        '{"cards":[{"id":0,"d":"a|e|n|x","u":"...","en":"...","ex":"...","t":"...",'
+        '"tc":"h|m|l","nc":"h|m|l","r":"..."}]}\n'
+        "Codes: d=a accept, d=e edit, d=n needs_review, d=x reject_high_confidence; tc/nc=h high, m medium, l low. Keep r short.\n\n"
+        "Lexical criteria:\n"
+        "- retain useful vocabulary even when no example sentence can be used; clear example and example_target instead of rejecting a card for weak context.\n"
+        "- when the available example is only the headword or another one-token fragment, retain the vocabulary card if the term and gloss are sound, and return empty example and example_target fields.\n"
+        "- use dictionary forms when a base vocabulary item is being taught rather than a specific phrase.\n"
+        "- treat the incoming English gloss as unverified; actively check that it names the same object, action, or concept as the Ukrainian term in context.\n"
+        "- correct translations or likely transcription errors only when supported by context; use needs_review instead of accepting an uncertain gloss.\n"
+        "- example_target must be the exact inflected surface form in example that expresses the Ukrainian headword; otherwise return an empty string.\n"
+        "- reject_high_confidence only if lexical inspection exposes clear noise or malformed non-Ukrainian material missed by selection.\n"
+        "- use needs_review for any plausible card with uncertain translation or normalization.\n\n"
+        f"Plausible cards:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_recovery_prompt(cards: Sequence[ReviewDisposition]) -> str:
+    payload = [
+        {
+            "id": index,
+            "ukrainian": item.card.ukrainian,
+            "english": item.card.english,
+            "example": item.card.example,
+            "previous_reason": item.reason,
+        }
+        for index, item in enumerate(cards)
+    ]
+    return (
+        "You are reconsidering Ukrainian vocabulary cards held for manual review after lexical cleanup.\n"
+        "A weak or missing example is not a reason to reject useful vocabulary; preserve the word card and leave example_target empty.\n"
+        "This includes useful standalone terms whose only available example is the term itself or another one-token fragment.\n"
+        "Return only valid JSON in this exact shape:\n"
+        '{"cards":[{"id":0,"d":"a|e|n|x","u":"...","en":"...","ex":"...","t":"...",'
+        '"tc":"h|m|l","nc":"h|m|l","r":"..."}]}\n'
+        "Codes: d=a accept, d=e edit, d=n needs_review, d=x reject_high_confidence; tc/nc=h high, m medium, l low. Keep r short.\n\n"
+        "- accept or edit when translation and normalization are reliable.\n"
+        "- keep as needs_review when the concept is useful but the correction is uncertain.\n"
+        "- reject_high_confidence only for clear noise, malformed text, or non-Ukrainian material.\n\n"
+        f"Pending cards:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def review_decisions_from_json(
+    content: str, original_cards: Sequence[VocabCard], *, phase: str
+) -> ReviewResult:
     parsed = parse_json_object(content)
     rows = parsed.get("cards", [])
     original_by_id = {index: card for index, card in enumerate(original_cards)}
-    reviewed: List[VocabCard] = []
+    accepted: List[VocabCard] = []
+    needs_review: List[ReviewDisposition] = []
+    rejected: List[ReviewDisposition] = []
+    responded_ids = set()
 
     for row in rows:
         try:
-            original = original_by_id[int(row.get("id"))]
+            card_id = int(row.get("id"))
+            original = original_by_id[card_id]
         except (TypeError, ValueError, KeyError):
             continue
+        responded_ids.add(card_id)
 
-        decision = str(row.get("decision", "")).casefold()
-        if decision == "drop":
+        decision = normalize_review_decision(row.get("d") or row.get("decision", ""))
+        reason = clean_text(str(row.get("r") or row.get("reason") or row.get("note") or "No reviewer reason supplied."))
+        decision_confidence = normalize_review_confidence(row.get("c") or row.get("decision_confidence", ""))
+        translation_confidence = normalize_review_confidence(row.get("tc") or row.get("translation_confidence", ""))
+        normalization_confidence = normalize_review_confidence(row.get("nc") or row.get("normalization_confidence", ""))
+
+        if phase == "selection":
+            candidate = original
+        else:
+            ukrainian = clean_text(str(row.get("u") or row.get("ukrainian") or original.ukrainian))
+            english = clean_text(str(row.get("en") or row.get("english") or original.english))
+            example = clean_text(str(row.get("ex") or row.get("example") or ""))
+            note = clean_text(str(row.get("r") or row.get("reason") or row.get("note") or original.note))
+            example_target = clean_text(str(row.get("t") or row.get("example_target") or ""))
+            if not ukrainian or not english or not CYRILLIC_RE.search(ukrainian):
+                needs_review.append(
+                    disposition_for_card(original, "needs_review", "Reviewer returned an unusable lexical edit.")
+                )
+                continue
+            candidate = sanitize_reviewed_cards(
+                [
+                    VocabCard(
+                        ukrainian=ukrainian,
+                        english=english,
+                        example=example,
+                        tags=f"{original.tags} reviewed",
+                        source=original.source,
+                        episode=original.episode,
+                        note=note,
+                        example_target=example_target,
+                    )
+                ]
+            )[0]
+
+        disposition = disposition_for_card(
+            candidate,
+            decision,
+            reason,
+            decision_confidence=decision_confidence,
+            translation_confidence=translation_confidence,
+            normalization_confidence=normalization_confidence,
+        )
+
+        if decision in {"accept", "edit", "keep"}:
+            if phase != "selection" and "low" in {translation_confidence, normalization_confidence}:
+                needs_review.append(
+                    disposition_for_card(
+                        candidate,
+                        "needs_review",
+                        "Low-confidence lexical decision requires manual review.",
+                        decision_confidence=decision_confidence,
+                        translation_confidence=translation_confidence,
+                        normalization_confidence=normalization_confidence,
+                    )
+                )
+            else:
+                accepted.append(candidate)
             continue
-        if decision not in {"keep", "edit"}:
+        if decision == "needs_review":
+            needs_review.append(disposition)
             continue
-
-        ukrainian = clean_text(str(row.get("ukrainian") or original.ukrainian))
-        english = clean_text(str(row.get("english") or original.english))
-        example = clean_text(str(row.get("example") or ""))
-        note = clean_text(str(row.get("note") or original.note))
-
-        if not ukrainian or not english or not CYRILLIC_RE.search(ukrainian):
+        if decision in {"reject_high_confidence", "drop"}:
+            if decision == "drop" or is_clear_high_confidence_rejection(reason):
+                rejected.append(disposition_for_card(candidate, "reject_high_confidence", reason, decision_confidence="high"))
+            else:
+                needs_review.append(
+                    disposition_for_card(
+                        candidate,
+                        "needs_review",
+                        f"Rejection needs confirmation: {reason}",
+                        decision_confidence=decision_confidence,
+                        translation_confidence=translation_confidence,
+                        normalization_confidence=normalization_confidence,
+                    )
+                )
             continue
-
-        reviewed.append(
-            VocabCard(
-                ukrainian=ukrainian,
-                english=english,
-                example=example,
-                tags=f"{original.tags} reviewed",
-                source=original.source,
-                episode=original.episode,
-                note=note,
+        needs_review.append(
+            disposition_for_card(
+                candidate,
+                "needs_review",
+                f"Reviewer returned unsupported decision: {decision or '(empty)'}.",
             )
         )
 
-    return reviewed
+    for card_id, original in original_by_id.items():
+        if card_id not in responded_ids:
+            needs_review.append(
+                disposition_for_card(
+                    original,
+                    "needs_review",
+                    "Reviewer omitted this input card from its response.",
+                )
+            )
+
+    return ReviewResult(dedupe_cards(accepted), dedupe_dispositions(needs_review), dedupe_dispositions(rejected))
+
+
+def reviewed_cards_from_json(
+    content: str, original_cards: Sequence[VocabCard]
+) -> tuple[List[VocabCard], List[ReviewDisposition]]:
+    result = review_decisions_from_json(content, original_cards, phase="lexical")
+    return result.accepted, result.rejected
+
+
+def disposition_for_card(
+    card: VocabCard,
+    decision: str,
+    reason: str,
+    *,
+    decision_confidence: str = "",
+    translation_confidence: str = "",
+    normalization_confidence: str = "",
+) -> ReviewDisposition:
+    return ReviewDisposition(
+        card=card,
+        decision=decision,
+        reason=reason,
+        decision_confidence=decision_confidence,
+        translation_confidence=translation_confidence,
+        normalization_confidence=normalization_confidence,
+    )
+
+
+def normalize_review_decision(value: object) -> str:
+    value = clean_text(str(value)).casefold()
+    return {
+        "a": "accept",
+        "e": "edit",
+        "n": "needs_review",
+        "x": "reject_high_confidence",
+    }.get(value, value)
+
+
+def normalize_review_confidence(value: object) -> str:
+    value = clean_text(str(value)).casefold()
+    return {"h": "high", "m": "medium", "l": "low"}.get(value, value)
+
+
+def is_clear_high_confidence_rejection(reason: str) -> bool:
+    reason = reason.casefold()
+    clear_noise_terms = (
+        "advert",
+        "outro",
+        "greeting",
+        "goodbye",
+        "membership",
+        "social",
+        "url",
+        "website",
+        "garbled",
+        "malformed",
+        "non-ukrainian",
+        "transliterated",
+    )
+    return any(term in reason for term in clear_noise_terms)
+
+
+def dedupe_dispositions(cards: Iterable[ReviewDisposition]) -> List[ReviewDisposition]:
+    unique: List[ReviewDisposition] = []
+    seen = set()
+    for item in cards:
+        key = item.card.ukrainian.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
 
 
 def dedupe_cards(cards: Iterable[VocabCard]) -> List[VocabCard]:
@@ -651,6 +971,206 @@ def dedupe_cards(cards: Iterable[VocabCard]) -> List[VocabCard]:
         seen.add(key)
         unique.append(card)
     return unique
+
+
+def sanitize_reviewed_cards(cards: Iterable[VocabCard]) -> List[VocabCard]:
+    sanitized: List[VocabCard] = []
+    for card in cards:
+        example = card.example
+        example_target = card.example_target
+        if example and not CYRILLIC_RE.search(example):
+            LOGGER.warning("Removing non-Ukrainian example for reviewed card: %s", card.ukrainian)
+            example = ""
+            example_target = ""
+        if example_target and not contains_exact_target(example, example_target):
+            LOGGER.warning("Removing invalid example target for reviewed card: %s", card.ukrainian)
+            example_target = ""
+        if example_target and not example_target_matches_headword(card.ukrainian, example_target):
+            LOGGER.warning("Removing unrelated example target for reviewed card: %s", card.ukrainian)
+            example_target = ""
+        if example_target and not useful_sentence_context(example, example_target):
+            LOGGER.warning("Removing low-context sentence target for reviewed card: %s", card.ukrainian)
+            example_target = ""
+        sanitized.append(
+            VocabCard(
+                ukrainian=card.ukrainian,
+                english=card.english,
+                example=example,
+                tags=card.tags,
+                source=card.source,
+                episode=card.episode,
+                note=card.note,
+                example_target=example_target,
+            )
+        )
+    return sanitized
+
+
+def validate_cards(cards: Iterable[VocabCard]) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for card in cards:
+        if card.example and not CYRILLIC_RE.search(card.example):
+            issues.append(
+                ValidationIssue("error", "non_ukrainian_example", card.ukrainian, "Example contains no Ukrainian text.")
+            )
+        if card.example_target and not contains_exact_target(card.example, card.example_target):
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "invalid_example_target",
+                    card.ukrainian,
+                    f"Example target {card.example_target!r} is not an exact term in the example.",
+                )
+            )
+        elif card.example_target and not example_target_matches_headword(card.ukrainian, card.example_target):
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "unrelated_example_target",
+                    card.ukrainian,
+                    f"Example target {card.example_target!r} is not plausibly a surface form of the headword.",
+                )
+            )
+        elif card.example_target and not useful_sentence_context(card.example, card.example_target):
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    "weak_sentence_context",
+                    card.ukrainian,
+                    "Hiding the target leaves too little sentence context for recall.",
+                )
+            )
+        if not card.example:
+            issues.append(ValidationIssue("info", "missing_example", card.ukrainian, "Card has no Ukrainian example."))
+        elif not card.example_target:
+            issues.append(
+                ValidationIssue(
+                    "info",
+                    "no_sentence_target",
+                    card.ukrainian,
+                    "Card is valid as vocabulary only; no safe sentence target was provided.",
+                )
+            )
+    return issues
+
+
+def write_validation_report(cards: Iterable[VocabCard], output_path: Path) -> int:
+    issues = validate_cards(cards)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(["Severity", "Code", "Ukrainian", "Message"])
+        for issue in issues:
+            writer.writerow([issue.severity, issue.code, issue.ukrainian, issue.message])
+    return len(issues)
+
+
+def write_review_dispositions(cards: Iterable[ReviewDisposition], output_path: Path) -> int:
+    cards = list(cards)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(
+            [
+                "Ukrainian",
+                "English",
+                "Example",
+                "ExampleTarget",
+                "Decision",
+                "Reason",
+                "DecisionConfidence",
+                "TranslationConfidence",
+                "NormalizationConfidence",
+                "Tags",
+                "Source",
+                "Episode",
+            ]
+        )
+        for item in cards:
+            card = item.card
+            writer.writerow(
+                [
+                    card.ukrainian,
+                    card.english,
+                    card.example,
+                    card.example_target,
+                    item.decision,
+                    item.reason,
+                    item.decision_confidence,
+                    item.translation_confidence,
+                    item.normalization_confidence,
+                    card.tags,
+                    card.source,
+                    card.episode,
+                ]
+            )
+    return len(cards)
+
+
+def write_rejected_cards(cards: Iterable[ReviewDisposition], output_path: Path) -> int:
+    return write_review_dispositions(cards, output_path)
+
+
+def evaluate_quality_fixture(cards: Iterable[VocabCard], fixture_path: Path) -> List[QualityCheckResult]:
+    with fixture_path.open("r", encoding="utf-8") as fixture_file:
+        fixture = json.load(fixture_file)
+
+    cards_by_term = {card.ukrainian.casefold(): card for card in sanitize_reviewed_cards(cards)}
+    results: List[QualityCheckResult] = []
+    for expectation in fixture.get("checks", []):
+        check = str(expectation.get("check", ""))
+        ukrainian = clean_text(str(expectation.get("ukrainian", "")))
+        card = cards_by_term.get(ukrainian.casefold())
+        passed = False
+        message = ""
+
+        if check == "keep":
+            passed = card is not None
+            message = "Card retained." if passed else "Required card was rejected or omitted."
+        elif check == "exclude":
+            passed = card is None
+            message = "Card excluded." if passed else "Card should be dropped or repaired before import."
+        elif check == "english_contains_any":
+            values = [str(value).casefold() for value in expectation.get("values", [])]
+            passed = card is not None and any(value in card.english.casefold() for value in values)
+            message = (
+                "Translation accepted."
+                if passed
+                else f"Expected translation containing one of: {', '.join(expectation.get('values', []))}."
+            )
+        elif check == "target_not_equals":
+            values = [str(value).casefold() for value in expectation.get("values", [])]
+            passed = card is None or card.example_target.casefold() not in values
+            message = (
+                "Unsafe sentence target absent."
+                if passed
+                else f"Sentence target must not be one of: {', '.join(expectation.get('values', []))}."
+            )
+        elif check == "target_equals_any":
+            values = [str(value).casefold() for value in expectation.get("values", [])]
+            passed = card is not None and card.example_target.casefold() in values
+            message = (
+                "Sentence target accepted."
+                if passed
+                else f"Expected full sentence target matching one of: {', '.join(expectation.get('values', []))}."
+            )
+        else:
+            message = f"Unknown fixture check type: {check}."
+
+        results.append(QualityCheckResult("pass" if passed else "fail", check, ukrainian, message))
+    return results
+
+
+def write_quality_report(cards: Iterable[VocabCard], fixture_path: Path, output_path: Path) -> tuple[int, int]:
+    results = evaluate_quality_fixture(cards, fixture_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(["Status", "Check", "Ukrainian", "Message"])
+        for result in results:
+            writer.writerow([result.status, result.check, result.ukrainian, result.message])
+    failures = sum(1 for result in results if result.status == "fail")
+    return len(results), failures
 
 
 def split_transcript(transcript: str, *, max_chars: int) -> List[str]:
@@ -697,6 +1217,7 @@ def cards_from_json_text(content: str, *, source: str, episode: str) -> List[Voc
         ukrainian = clean_text(str(row.get("ukrainian", "")))
         english = clean_text(str(row.get("english", "")))
         example = clean_text(str(row.get("example", "")))
+        example_target = clean_text(str(row.get("example_target", "")))
         key = ukrainian.casefold()
         if not ukrainian or not english or key in seen or not CYRILLIC_RE.search(ukrainian):
             continue
@@ -710,6 +1231,7 @@ def cards_from_json_text(content: str, *, source: str, episode: str) -> List[Voc
                 source=source,
                 episode=episode,
                 note=clean_text(str(row.get("note", ""))),
+                example_target=example_target,
             )
         )
 
@@ -732,12 +1254,13 @@ def build_vocab_prompt(transcript: str, *, max_cards: int) -> str:
     return (
         f"Extract up to {max_cards} Ukrainian vocabulary flashcards from this transcript.\n"
         "Return only JSON in this exact shape:\n"
-        '{"cards":[{"ukrainian":"...","english":"...","example":"...","note":"..."}]}\n\n'
+        '{"cards":[{"ukrainian":"...","english":"...","example":"...","example_target":"...","note":"..."}]}\n\n'
         "Rules:\n"
         "- Extract only useful Ukrainian vocabulary for an English-speaking learner.\n"
         "- ukrainian: a normal Ukrainian dictionary form, common phrase, or lesson phrase.\n"
         "- english: concise English meaning or translation.\n"
         "- example: a short natural Ukrainian example phrase from the transcript when possible.\n"
+        "- example_target: the exact Ukrainian surface word or phrase in example that expresses ukrainian; use an empty string if no useful example is available.\n"
         "- note: optional brief usage note, otherwise empty string.\n"
         "- Prefer food, recipe, cooking, quantity, and core episode-topic vocabulary.\n"
         "- Prefer lemmas: use готувати, not готувала; цукор, not цукру, unless the inflected form is the teaching point.\n"
@@ -829,10 +1352,18 @@ def write_field_cards(cards: Iterable[VocabCard], output_path: Path) -> int:
     count = 0
     with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
         writer = csv.writer(output_file)
-        writer.writerow(["Ukrainian", "English", "Example", "Tags", "Source", "Episode"])
+        writer.writerow(["Ukrainian", "English", "Example", "ExampleTarget", "Tags", "Source", "Episode"])
         for card in cards:
             writer.writerow(
-                [card.ukrainian, card.english, card.example, card.tags, card.source, card.episode]
+                [
+                    card.ukrainian,
+                    card.english,
+                    card.example,
+                    card.example_target,
+                    card.tags,
+                    card.source,
+                    card.episode,
+                ]
             )
             count += 1
     return count
@@ -861,12 +1392,12 @@ def write_basic_cards(
             )
             count += 1
 
-            sentence_front = build_sentence_front(card.example, card.ukrainian)
+            sentence_front = build_sentence_front(card.example, card.example_target, card.ukrainian)
             if include_sentence_cards and sentence_front:
                 writer.writerow(
                     [
                         sentence_front,
-                        f"{highlight_term(card.example, card.ukrainian)}<br><br>{card.ukrainian} - {card.english}",
+                        f"{highlight_term(card.example, card.example_target)}<br><br>{card.ukrainian} - {card.english}",
                         f"{card.tags} sentence",
                         card.source,
                         card.episode,
@@ -909,13 +1440,13 @@ def write_sentence_cards(cards: Iterable[VocabCard], output_path: Path) -> int:
         writer = csv.writer(output_file)
         writer.writerow(["Front", "Back", "Tags", "Source", "Episode", "CardType"])
         for card in cards:
-            sentence_front = build_sentence_front(card.example, card.ukrainian)
+            sentence_front = build_sentence_front(card.example, card.example_target, card.ukrainian)
             if not sentence_front:
                 continue
             writer.writerow(
                 [
                     sentence_front,
-                    f"{highlight_term(card.example, card.ukrainian)}<br><br>{card.ukrainian} - {card.english}",
+                    f"{highlight_term(card.example, card.example_target)}<br><br>{card.ukrainian} - {card.english}",
                     f"{card.tags} sentence",
                     card.source,
                     card.episode,
@@ -936,11 +1467,13 @@ def read_cards_csv(path: Path) -> List[VocabCard]:
                 ukrainian = clean_text(row.get("Ukrainian", ""))
                 english = clean_text(row.get("English", ""))
                 example = clean_text(row.get("Example", ""))
+                example_target = clean_text(row.get("ExampleTarget", ""))
             elif "Front" in fieldnames and "Back" in fieldnames:
                 if row.get("CardType") == "sentence":
                     continue
                 ukrainian = clean_text(row.get("Front", ""))
                 english, example = split_basic_back(row.get("Back", ""))
+                example_target = ""
             else:
                 raise ValueError(f"Unsupported CSV columns in {path}: {reader.fieldnames}")
 
@@ -954,6 +1487,7 @@ def read_cards_csv(path: Path) -> List[VocabCard]:
                     tags=row.get("Tags", "ukrainian podcast transcript vocab"),
                     source=row.get("Source", str(path)),
                     episode=row.get("Episode", path.stem),
+                    example_target=example_target,
                 )
             )
     return cards
@@ -968,22 +1502,73 @@ def split_basic_back(value: str) -> tuple[str, str]:
 
 def build_vocab_back(card: VocabCard) -> str:
     if card.example:
-        return f"{card.english}<br><br>{highlight_term(card.example, card.ukrainian)}"
+        target = (
+            card.example_target
+            if contains_exact_target(card.example, card.example_target)
+            and example_target_matches_headword(card.ukrainian, card.example_target)
+            else ""
+        )
+        return f"{card.english}<br><br>{highlight_term(card.example, target)}"
     return card.english
 
 
-def highlight_term(sentence: str, term: str) -> str:
-    if not sentence or not term:
+def highlight_term(sentence: str, target: str) -> str:
+    if not sentence or not target:
         return sentence
-    return re.sub(re.escape(term), f"<b>{term}</b>", sentence, flags=re.IGNORECASE)
+    return target_pattern(target).sub(f"<b>{target}</b>", sentence, count=1)
 
 
-def build_sentence_front(sentence: str, term: str) -> str:
-    if not sentence or not term:
+def build_sentence_front(sentence: str, target: str, headword: str = "") -> str:
+    if (
+        not contains_exact_target(sentence, target)
+        or (headword and not example_target_matches_headword(headword, target))
+        or not useful_sentence_context(sentence, target)
+    ):
         return ""
-    if not re.search(re.escape(term), sentence, flags=re.IGNORECASE):
-        return ""
-    return re.sub(re.escape(term), "[...]", sentence, count=1, flags=re.IGNORECASE)
+    return target_pattern(target).sub("[...]", sentence, count=1)
+
+
+def contains_exact_target(sentence: str, target: str) -> bool:
+    if not sentence or not target:
+        return False
+    return target_pattern(target).search(sentence) is not None
+
+
+def useful_sentence_context(sentence: str, target: str) -> bool:
+    if not contains_exact_target(sentence, target):
+        return False
+    prompt = target_pattern(target).sub("", sentence, count=1)
+    return len(re.findall(r"[\u0400-\u04ff]{2,}", prompt)) >= 2
+
+
+def example_target_matches_headword(headword: str, target: str) -> bool:
+    headword_tokens = ukrainian_tokens(headword)
+    target_tokens = ukrainian_tokens(target)
+    if not headword_tokens or len(headword_tokens) != len(target_tokens):
+        return False
+    return all(plausibly_related_surface_forms(base, surface) for base, surface in zip(headword_tokens, target_tokens))
+
+
+def ukrainian_tokens(text: str) -> List[str]:
+    return [token.casefold().replace("’", "'") for token in UKRAINIAN_TOKEN_RE.findall(text)]
+
+
+def plausibly_related_surface_forms(headword_token: str, target_token: str) -> bool:
+    if headword_token == target_token:
+        return True
+    prefix_length = 0
+    for headword_char, target_char in zip(headword_token, target_token):
+        if headword_char != target_char:
+            break
+        prefix_length += 1
+    return prefix_length >= min(3, len(headword_token), len(target_token))
+
+
+def target_pattern(target: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"(?<![\u0400-\u04ff]){re.escape(target)}(?![\u0400-\u04ff])",
+        flags=re.IGNORECASE,
+    )
 
 
 def read_or_create_transcript(args: argparse.Namespace, episode: Optional[Episode]) -> tuple[str, str, str]:
@@ -1040,6 +1625,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript-file", type=Path, help="Use an existing transcript and skip transcription.")
     parser.add_argument("--review-input", type=Path, help="Review an existing generated CSV instead of extracting.")
     parser.add_argument("--format-input", type=Path, help="Reformat an existing generated CSV without model calls.")
+    parser.add_argument("--validate-input", type=Path, help="Write a validation report for an existing card CSV.")
+    parser.add_argument("--validation-output", type=Path, default=Path("outputs/card_validation_report.csv"))
+    parser.add_argument("--evaluate-input", type=Path, help="Evaluate an existing reviewed CSV against a quality fixture.")
+    parser.add_argument("--quality-fixture", type=Path, help="JSON quality fixture used with --evaluate-input.")
+    parser.add_argument("--quality-output", type=Path, default=Path("outputs/card_quality_report.csv"))
+    parser.add_argument(
+        "--rejected-output",
+        type=Path,
+        help="Rejected-card audit CSV path. Review runs default to an output-derived _rejected CSV.",
+    )
+    parser.add_argument(
+        "--needs-review-output",
+        type=Path,
+        help="Pending-card audit CSV path. Review runs default to an output-derived _needs_review CSV.",
+    )
     parser.add_argument("--resume-input", type=Path, help="Seed extraction from a previously written checkpoint CSV.")
     parser.add_argument(
         "--resume-after-batch",
@@ -1052,7 +1652,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transcript-dir", type=Path, default=Path("transcripts"), help="Where transcripts are cached."
     )
-    parser.add_argument("--output", type=Path, default=Path("anki_from_transcript.csv"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/anki_from_transcript.csv"))
     parser.add_argument("--max-cards", type=int, default=60)
     parser.add_argument(
         "--card-format",
@@ -1128,8 +1728,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("OLLAMA_RETRIES", DEFAULT_OLLAMA_RETRIES)),
         help="Number of retries when Ollama returns malformed JSON.",
     )
-    parser.add_argument("--review-cards", action="store_true", help="Run a second LLM pass to validate/edit/drop cards.")
+    parser.add_argument(
+        "--review-cards",
+        action="store_true",
+        help="Run separate local LLM selection and lexical-cleanup passes before deterministic validation.",
+    )
     parser.add_argument("--review-batch-size", type=int, default=20, help="Cards per LLM review batch.")
+    parser.add_argument(
+        "--recover-needs-review",
+        action="store_true",
+        help="Run a focused additional LLM pass on cards held for manual review during lexical cleanup.",
+    )
     parser.add_argument("--text-model", default=os.environ.get("OPENAI_TEXT_MODEL", DEFAULT_TEXT_MODEL))
     parser.add_argument(
         "--log-level",
@@ -1142,6 +1751,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def configure_logging(level: str, log_file: Optional[Path]) -> None:
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
     handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1165,12 +1778,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.info("Starting episode-to-Anki pipeline")
         if args.resume_after_batch and not args.resume_input:
             raise RuntimeError("--resume-after-batch requires --resume-input.")
+        if args.quality_fixture and not args.evaluate_input:
+            raise RuntimeError("--quality-fixture requires --evaluate-input.")
         if args.format_input:
             LOGGER.info("Reading cards for reformatting: %s", args.format_input)
             cards = read_cards_csv(args.format_input)
             count = write_cards(cards, args.output, card_format=args.card_format)
             LOGGER.info("Wrote %d reformatted rows from %s", count, args.format_input)
             return 0
+        if args.validate_input:
+            LOGGER.info("Reading cards for validation: %s", args.validate_input)
+            cards = read_cards_csv(args.validate_input)
+            count = write_validation_report(cards, args.validation_output)
+            LOGGER.info("Wrote %d validation findings to %s", count, args.validation_output)
+            return 0
+        if args.evaluate_input:
+            if not args.quality_fixture:
+                raise RuntimeError("--evaluate-input requires --quality-fixture.")
+            LOGGER.info("Reading reviewed cards for quality evaluation: %s", args.evaluate_input)
+            cards = read_cards_csv(args.evaluate_input)
+            count, failures = write_quality_report(cards, args.quality_fixture, args.quality_output)
+            LOGGER.info("Wrote %d quality checks to %s (%d failed)", count, args.quality_output, failures)
+            return 1 if failures else 0
 
         if args.review_input:
             vocab_model = args.ollama_model if args.vocab_provider == "ollama" else args.text_model
@@ -1179,7 +1808,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             LOGGER.info("Loaded %d vocabulary cards for review", len(cards))
             if args.vocab_provider != "ollama":
                 raise RuntimeError("--review-input currently supports local Ollama review only.")
-            cards = review_cards_ollama(
+            rejected_output = args.rejected_output or suffixed_output_path(args.output, "rejected")
+            needs_review_output = args.needs_review_output or suffixed_output_path(args.output, "needs_review")
+            review_result = review_cards_ollama(
                 cards,
                 model=vocab_model,
                 url=args.ollama_url,
@@ -1188,10 +1819,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 retries=args.ollama_retries,
                 batch_size=args.review_batch_size,
                 checkpoint_output=args.output,
+                needs_review_output=needs_review_output,
+                rejected_output=rejected_output,
+                recover_needs_review=args.recover_needs_review,
                 card_format=args.card_format,
             )
+            cards = review_result.accepted
             count = write_cards(cards, args.output, card_format=args.card_format)
+            validation_output = suffixed_output_path(args.output, "validation")
+            validation_count = write_validation_report(cards, validation_output)
             LOGGER.info("Wrote %d reviewed cards to %s", count, args.output)
+            LOGGER.info("Wrote %d validation findings to %s", validation_count, validation_output)
+            LOGGER.info("Needs-review audit available at %s", needs_review_output)
+            LOGGER.info("Rejected-card audit available at %s", rejected_output)
             LOGGER.info("Elapsed: %.1fs", time.time() - started)
             return 0
 
@@ -1256,7 +1896,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             extraction_snapshot = suffixed_output_path(args.output, "extracted")
             extracted_count = write_cards(cards, extraction_snapshot, card_format="fields")
             LOGGER.info("Extraction snapshot written before review: %s (%d cards)", extraction_snapshot, extracted_count)
-            cards = review_cards_ollama(
+            rejected_output = args.rejected_output or suffixed_output_path(args.output, "rejected")
+            needs_review_output = args.needs_review_output or suffixed_output_path(args.output, "needs_review")
+            review_result = review_cards_ollama(
                 cards,
                 model=vocab_model,
                 url=args.ollama_url,
@@ -1265,9 +1907,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 retries=args.ollama_retries,
                 batch_size=args.review_batch_size,
                 checkpoint_output=args.output,
+                needs_review_output=needs_review_output,
+                rejected_output=rejected_output,
+                recover_needs_review=args.recover_needs_review,
                 card_format=args.card_format,
             )
+            cards = review_result.accepted
         count = write_cards(cards, args.output, card_format=args.card_format)
+        if args.review_cards:
+            validation_output = suffixed_output_path(args.output, "validation")
+            validation_count = write_validation_report(cards, validation_output)
+            LOGGER.info("Wrote %d validation findings to %s", validation_count, validation_output)
+            LOGGER.info("Needs-review audit available at %s", needs_review_output)
+            LOGGER.info("Rejected-card audit available at %s", rejected_output)
     except Exception as exc:
         LOGGER.exception("Pipeline failed: %s", exc)
         return 1
