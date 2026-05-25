@@ -112,6 +112,16 @@ Run local extraction in smaller batches:
 --batch-chars 4000 --cards-per-batch 8
 ```
 
+Low-RAM profile for the 8 GB laptop (slower but safer while avoiding stalls):
+
+```powershell
+--ollama-model qwen3:4b --batch-chars 1200 --cards-per-batch 6 --review-batch-size 4
+```
+
+If you plan to run a full episode review, prefer starting it when other heavy
+apps/work are finished. This reduces timeout risk and keeps the machine
+responsive.
+
 Show progress and keep a log file:
 
 ```powershell
@@ -272,6 +282,24 @@ Example review-only rerun with focused recovery:
 python episode_to_anki.py --review-input outputs\ulp_2_50\extracted.csv --output outputs\ulp_2_50\reviewed.csv --card-format bidirectional-with-sentences --review-batch-size 6 --recover-needs-review --ollama-timeout 900
 ```
 
+Optional Anki duplicate cross-check before review:
+
+```powershell
+python episode_to_anki.py --review-input outputs\ulp_2_50\extracted.csv --output outputs\ulp_2_50\reviewed.csv --card-format bidirectional-with-sentences --review-batch-size 6 --crosscheck-anki --crosscheck-anki-deck "Ukrainian::ULP" --crosscheck-fuzzy-threshold 0.84 --ollama-timeout 900
+```
+
+When enabled, cards that match existing Anki notes (exact or fuzzy front-text
+match) are moved to `*_needs_review.csv` with reason `duplicate_card` and match
+metadata (note id, matched front/back, score). A `*_duplicates.csv` audit is
+also written so potential repeats can be reviewed explicitly instead of silently
+dropped.
+
+Use `--duplicate-policy` to control matched-card handling:
+
+- `needs_review` (default): send matched cards to manual review.
+- `skip`: drop matched cards from reviewed output, keep them in `*_duplicates.csv`.
+- `keep`: keep matched cards in reviewed output, but still log matches in `*_duplicates.csv`.
+
 Generate a validation report for an existing reviewed CSV without any model
 calls:
 
@@ -355,6 +383,35 @@ or `--anki-update-existing` to the UI command, to update notes previously
 created through this integration. Cards manually imported before AnkiConnect
 was introduced do not carry these tags and are not automatically matched for
 updates.
+
+## Cloud + Mobile Workflow Notes
+
+Running in the cloud is mainly a convenience and automation upgrade: trigger
+jobs from mobile, keep a queue running while your laptop is offline, and keep
+logs/artifacts in one place. The current checkpointed pipeline already fits this
+well if episode artifacts remain grouped under `outputs/<episode>/`.
+
+For mobile-triggered runs, a practical rollout is:
+
+- start with one cloud VM worker and durable storage for transcripts, logs, and
+  checkpoints
+- add an authenticated trigger (webhook/shortcut/bot) that enqueues one episode
+- keep resume-first behavior so interrupted runs continue from the latest valid
+  checkpoint
+
+For final review and import from mobile, treat these as separate concerns:
+
+- Final validation can be mobile-friendly by hosting the review UI behind auth.
+- Direct Anki push still depends on where Anki is running.
+  - AnkiConnect is desktop-local by default (`http://127.0.0.1:8765`).
+  - If Anki is not running on the same machine, use file handoff (`*_words.csv`,
+    `*_sentences.csv`, or `.apkg`) and import later.
+  - A one-tap remote push is possible with a secure home bridge that forwards to
+    local AnkiConnect, but this is an advanced setup.
+
+There is no stable, official "write cards to AnkiWeb from any server" workflow
+documented for this project; keep cloud delivery focused on approved exports and
+explicit user import unless a bridge path is deliberately configured.
 
 If a batched extraction fails after writing a checkpoint, resume from it without
 repeating completed batches:

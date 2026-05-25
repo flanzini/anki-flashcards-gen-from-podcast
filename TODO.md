@@ -71,8 +71,10 @@
 
 - [ ] Cross-reference newly generated vocabulary against cards from previous sessions.
   - Load existing exported/reviewed CSVs and, later, cards already stored in Anki.
-  - Drop exact duplicate lemmas before review/import.
-  - Detect near-duplicates such as inflected forms, spelling variants, and synonymous short phrases.
+  - [x] Cross-check generated cards against existing Anki notes before review and mark matches as `duplicate_card` for manual validation.
+  - [x] Detect near-duplicates with fuzzy front-text matching and write a duplicate audit report with matched note metadata.
+  - [x] Add configurable duplicate policy (`needs_review`, `skip`, `keep`) for cross-check behavior.
+  - [ ] Tune duplicate thresholds and matching rules against real backfill runs to reduce false positives.
   - Keep a configurable policy for whether to skip, replace, or enrich an existing card with a better example.
   - Log which new items were excluded and which existing card they matched.
 
@@ -85,7 +87,9 @@
   - whether extraction completed
   - number of vocabulary cards and sentence cards
   - latest log errors
-- [ ] Consider exporting `.apkg` files as an alternative to CSV import.
+- [ ] Add `.apkg` export as an alternative to CSV import for cloud/mobile handoff.
+  - Prefer deterministic packaging from already approved split CSVs.
+  - Keep note-type mapping consistent: words -> `Basic (and reversed card)`, sentences -> `Basic`.
 
 ## Repository Organization
 
@@ -103,8 +107,25 @@
 ## Cloud Execution
 
 - [ ] Support running the pipeline remotely instead of only on the local Windows machine.
-  - Decide between a managed API workflow and hosting local-model equivalents on a cloud GPU.
+  - Start with CPU VM + local-model workflow; treat GPU hosting as an optional later optimization.
   - Store transcripts, checkpoints, reviewed cards, and logs in durable cloud storage.
   - Make interrupted jobs resumable across machines/runs.
   - Keep API keys and credentials outside checked-in files.
-  - Estimate ongoing transcription/model/runtime costs before selecting an implementation.
+  - Keep checkpoint/review artifact layout compatible with current `outputs/<episode>/` conventions.
+- [x] Estimate cloud runtime costs from observed local logs for planning.
+  - Use ~2.8 hours/episode as a baseline full-run estimate until cloud benchmarks are captured.
+- [ ] Benchmark one representative episode on a candidate GCP VM and compare with local baseline.
+  - Measure transcription, extraction, and review phases separately.
+  - Record on-demand and Spot costs with runtime variance.
+- [ ] Add a remote queue/trigger path that can be started from mobile.
+  - Option A: webhook endpoint plus authenticated job enqueue.
+  - Option B: RSS polling trigger for new episodes.
+- [ ] Add remote run status visibility suitable for mobile.
+  - Expose per-episode stage (`transcribe`, `extract`, `review`, `validate`) and log tail.
+- [ ] Add a remote final-validation UX path for mobile browser use.
+  - Host the existing review flow behind authentication, or provide an equivalent web review UI.
+  - Preserve accepted/pending/rejected outputs and final approved export behavior.
+- [ ] Define cloud-to-Anki delivery options explicitly in docs and scripts.
+  - Preferred low-friction path: approved split CSV and/or `.apkg` export for later import.
+  - Optional advanced path: secure home AnkiConnect bridge for one-tap remote push.
+  - Android-specific path to evaluate separately: direct AnkiDroid API integration via a companion app.

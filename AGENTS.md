@@ -25,6 +25,12 @@ workflow and preserve expensive intermediate work.
   only for small experiments: a six-card review took about 402 seconds and
   reduced free RAM to about 0.4 GB. Do not use it for routine full-episode
   review without explicit user agreement.
+- For routine local runs on this machine, default to `qwen3:4b` and conservative
+  batch sizes (for example `--batch-chars 1200 --cards-per-batch 6
+  --review-batch-size 4`).
+- If possible, schedule full-episode review runs after finishing other
+  memory-heavy work. Treat this as the preferred reliability setting rather
+  than trying to force hard memory caps.
 - If a pipeline run fails, identify whether transcription, extraction, or
   review failed and resume from the most advanced valid artifact.
 - Do not delete or overwrite useful partial results while investigating a

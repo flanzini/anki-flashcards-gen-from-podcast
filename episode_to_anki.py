@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import json
 import logging
 import mimetypes
@@ -48,6 +49,7 @@ DEFAULT_OLLAMA_NUM_PREDICT = 2048
 DEFAULT_OLLAMA_RETRIES = 2
 DEFAULT_BATCH_CHARS = 5000
 DEFAULT_CARDS_PER_BATCH = 10
+DEFAULT_ANKI_URL = "http://127.0.0.1:8765"
 
 LOGGER = logging.getLogger("episode_to_anki")
 
@@ -95,6 +97,16 @@ class QualityCheckResult:
     check: str
     ukrainian: str
     message: str
+
+
+@dataclass(frozen=True)
+class AnkiDuplicateMatch:
+    note_id: int
+    deck: str
+    front: str
+    back: str
+    similarity: float
+    match_type: str
 
 
 def select_episode(
@@ -543,12 +555,13 @@ def review_cards_ollama(
     rejected_output: Optional[Path] = None,
     recover_needs_review: bool = False,
     card_format: str = "fields",
+    initial_needs_review: Sequence[ReviewDisposition] = (),
 ) -> ReviewResult:
     if not cards:
-        return ReviewResult([], [], [])
+        return ReviewResult([], dedupe_dispositions(initial_needs_review), [])
 
     accepted: List[VocabCard] = []
-    needs_review: List[ReviewDisposition] = []
+    needs_review: List[ReviewDisposition] = list(initial_needs_review)
     rejected: List[ReviewDisposition] = []
     batches = [list(cards[index : index + batch_size]) for index in range(0, len(cards), batch_size)]
     LOGGER.info("Reviewing %d vocabulary items in %d batch(es) using separated passes", len(cards), len(batches))
@@ -1109,6 +1122,159 @@ def write_review_dispositions(cards: Iterable[ReviewDisposition], output_path: P
 
 def write_rejected_cards(cards: Iterable[ReviewDisposition], output_path: Path) -> int:
     return write_review_dispositions(cards, output_path)
+
+
+def anki_invoke(action: str, params: Optional[dict] = None, *, url: str, timeout: int = 30) -> object:
+    payload = json.dumps({"action": action, "version": 6, "params": params or {}}).encode("utf-8")
+    request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(
+            f"Could not reach AnkiConnect at {url}. Ensure Anki is open and the AnkiConnect add-on is installed."
+        ) from exc
+    if not isinstance(data, dict) or "error" not in data or "result" not in data:
+        raise RuntimeError("AnkiConnect returned an unexpected response.")
+    if data["error"]:
+        raise RuntimeError(f"AnkiConnect error during {action}: {data['error']}")
+    return data["result"]
+
+
+def normalized_ukrainian_key(text: str) -> str:
+    tokens = ukrainian_tokens(text)
+    return " ".join(tokens)
+
+
+def fetch_anki_front_index(*, deck: str, url: str) -> List[AnkiDuplicateMatch]:
+    note_ids = anki_invoke("findNotes", {"query": f'deck:"{deck}"'}, url=url)
+    if not isinstance(note_ids, list) or not note_ids:
+        return []
+    notes = anki_invoke("notesInfo", {"notes": note_ids}, url=url)
+    if not isinstance(notes, list):
+        return []
+    indexed: List[AnkiDuplicateMatch] = []
+    for note in notes:
+        if not isinstance(note, dict):
+            continue
+        fields = note.get("fields") or {}
+        if not isinstance(fields, dict):
+            continue
+        front_data = fields.get("Front")
+        back_data = fields.get("Back")
+        front = ""
+        back = ""
+        if isinstance(front_data, dict):
+            front = clean_text(str(front_data.get("value", "")))
+        if isinstance(back_data, dict):
+            back = clean_text(str(back_data.get("value", "")))
+        if not front:
+            continue
+        note_id = note.get("noteId")
+        if not isinstance(note_id, int):
+            continue
+        indexed.append(
+            AnkiDuplicateMatch(
+                note_id=note_id,
+                deck=clean_text(str(note.get("deckName", deck))) or deck,
+                front=front,
+                back=back,
+                similarity=1.0,
+                match_type="indexed",
+            )
+        )
+    return indexed
+
+
+def find_duplicate_match(
+    card: VocabCard,
+    anki_notes: Sequence[AnkiDuplicateMatch],
+    *,
+    fuzzy_threshold: float,
+) -> Optional[AnkiDuplicateMatch]:
+    card_key = normalized_ukrainian_key(card.ukrainian)
+    if not card_key:
+        return None
+
+    exact_match: Optional[AnkiDuplicateMatch] = None
+    best_fuzzy: Optional[AnkiDuplicateMatch] = None
+    best_score = 0.0
+
+    for note in anki_notes:
+        note_key = normalized_ukrainian_key(note.front)
+        if not note_key:
+            continue
+        if note_key == card_key:
+            exact_match = AnkiDuplicateMatch(
+                note_id=note.note_id,
+                deck=note.deck,
+                front=note.front,
+                back=note.back,
+                similarity=1.0,
+                match_type="exact_front",
+            )
+            break
+        score = difflib.SequenceMatcher(a=card_key, b=note_key).ratio()
+        if score > best_score:
+            best_score = score
+            best_fuzzy = AnkiDuplicateMatch(
+                note_id=note.note_id,
+                deck=note.deck,
+                front=note.front,
+                back=note.back,
+                similarity=score,
+                match_type="fuzzy_front",
+            )
+
+    if exact_match:
+        return exact_match
+    if best_fuzzy and best_score >= fuzzy_threshold:
+        return best_fuzzy
+    return None
+
+
+def mark_anki_duplicates(
+    cards: Sequence[VocabCard],
+    *,
+    deck: str,
+    url: str,
+    fuzzy_threshold: float,
+    duplicate_policy: str,
+) -> tuple[List[VocabCard], List[ReviewDisposition]]:
+    anki_notes = fetch_anki_front_index(deck=deck, url=url)
+    LOGGER.info("Loaded %d existing Anki notes from deck %s for duplicate cross-check", len(anki_notes), deck)
+    retained: List[VocabCard] = []
+    duplicate_dispositions: List[ReviewDisposition] = []
+    for card in cards:
+        match = find_duplicate_match(card, anki_notes, fuzzy_threshold=fuzzy_threshold)
+        if not match:
+            retained.append(card)
+            continue
+        reason = (
+            "duplicate_card: "
+            f"{match.match_type} score={match.similarity:.3f} "
+            f"matches note_id={match.note_id} front={match.front!r} back={match.back!r} deck={match.deck!r}"
+        )
+        if duplicate_policy == "keep":
+            duplicate_dispositions.append(
+                disposition_for_card(card, "duplicate_keep", reason, decision_confidence="medium")
+            )
+            retained.append(card)
+            continue
+        if duplicate_policy == "skip":
+            duplicate_dispositions.append(
+                disposition_for_card(card, "duplicate_skip", reason, decision_confidence="high")
+            )
+            continue
+        duplicate_dispositions.append(
+            disposition_for_card(
+                card,
+                "needs_review",
+                reason,
+                decision_confidence="high" if match.match_type == "exact_front" else "medium",
+            )
+        )
+    return retained, dedupe_dispositions(duplicate_dispositions)
 
 
 def evaluate_quality_fixture(cards: Iterable[VocabCard], fixture_path: Path) -> List[QualityCheckResult]:
@@ -1739,6 +1905,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run a focused additional LLM pass on cards held for manual review during lexical cleanup.",
     )
+    parser.add_argument(
+        "--crosscheck-anki",
+        action="store_true",
+        help="Cross-check generated cards against existing Anki notes before review and route matches to needs-review.",
+    )
+    parser.add_argument(
+        "--crosscheck-anki-deck",
+        default="",
+        help="Anki deck name used for duplicate cross-check. Required when --crosscheck-anki is set.",
+    )
+    parser.add_argument(
+        "--crosscheck-anki-url",
+        default=DEFAULT_ANKI_URL,
+        help="AnkiConnect URL used for duplicate cross-check.",
+    )
+    parser.add_argument(
+        "--crosscheck-fuzzy-threshold",
+        type=float,
+        default=0.84,
+        help="Similarity threshold for fuzzy duplicate matching against Anki fronts (0-1).",
+    )
+    parser.add_argument(
+        "--duplicates-output",
+        type=Path,
+        help="Optional duplicate-match audit CSV path. Defaults to output-derived _duplicates CSV when cross-check runs.",
+    )
+    parser.add_argument(
+        "--duplicate-policy",
+        choices=["needs_review", "skip", "keep"],
+        default="needs_review",
+        help="How to handle matched Anki duplicates during cross-check.",
+    )
     parser.add_argument("--text-model", default=os.environ.get("OPENAI_TEXT_MODEL", DEFAULT_TEXT_MODEL))
     parser.add_argument(
         "--log-level",
@@ -1780,6 +1978,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise RuntimeError("--resume-after-batch requires --resume-input.")
         if args.quality_fixture and not args.evaluate_input:
             raise RuntimeError("--quality-fixture requires --evaluate-input.")
+        if args.crosscheck_anki:
+            if not args.crosscheck_anki_deck:
+                raise RuntimeError("--crosscheck-anki requires --crosscheck-anki-deck.")
+            if not (0.0 <= args.crosscheck_fuzzy_threshold <= 1.0):
+                raise RuntimeError("--crosscheck-fuzzy-threshold must be between 0 and 1.")
+            if not (args.review_input or args.review_cards):
+                raise RuntimeError("--crosscheck-anki currently supports review flows (--review-input or --review-cards).")
         if args.format_input:
             LOGGER.info("Reading cards for reformatting: %s", args.format_input)
             cards = read_cards_csv(args.format_input)
@@ -1810,6 +2015,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RuntimeError("--review-input currently supports local Ollama review only.")
             rejected_output = args.rejected_output or suffixed_output_path(args.output, "rejected")
             needs_review_output = args.needs_review_output or suffixed_output_path(args.output, "needs_review")
+            duplicate_dispositions: List[ReviewDisposition] = []
+            duplicates_output: Optional[Path] = None
+            if args.crosscheck_anki:
+                duplicates_output = args.duplicates_output or suffixed_output_path(args.output, "duplicates")
+                cards, duplicate_dispositions = mark_anki_duplicates(
+                    cards,
+                    deck=args.crosscheck_anki_deck,
+                    url=args.crosscheck_anki_url,
+                    fuzzy_threshold=args.crosscheck_fuzzy_threshold,
+                    duplicate_policy=args.duplicate_policy,
+                )
+                duplicate_count = write_review_dispositions(duplicate_dispositions, duplicates_output)
+                LOGGER.info("Duplicate-card audit written: %s (%d rows)", duplicates_output, duplicate_count)
+                LOGGER.info("Cross-check retained %d cards for model review", len(cards))
             review_result = review_cards_ollama(
                 cards,
                 model=vocab_model,
@@ -1823,6 +2042,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 rejected_output=rejected_output,
                 recover_needs_review=args.recover_needs_review,
                 card_format=args.card_format,
+                initial_needs_review=duplicate_dispositions,
             )
             cards = review_result.accepted
             count = write_cards(cards, args.output, card_format=args.card_format)
@@ -1832,6 +2052,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             LOGGER.info("Wrote %d validation findings to %s", validation_count, validation_output)
             LOGGER.info("Needs-review audit available at %s", needs_review_output)
             LOGGER.info("Rejected-card audit available at %s", rejected_output)
+            if duplicates_output:
+                LOGGER.info("Duplicate-card audit available at %s", duplicates_output)
             LOGGER.info("Elapsed: %.1fs", time.time() - started)
             return 0
 
@@ -1898,6 +2120,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             LOGGER.info("Extraction snapshot written before review: %s (%d cards)", extraction_snapshot, extracted_count)
             rejected_output = args.rejected_output or suffixed_output_path(args.output, "rejected")
             needs_review_output = args.needs_review_output or suffixed_output_path(args.output, "needs_review")
+            duplicate_dispositions = []
+            duplicates_output: Optional[Path] = None
+            if args.crosscheck_anki:
+                duplicates_output = args.duplicates_output or suffixed_output_path(args.output, "duplicates")
+                cards, duplicate_dispositions = mark_anki_duplicates(
+                    cards,
+                    deck=args.crosscheck_anki_deck,
+                    url=args.crosscheck_anki_url,
+                    fuzzy_threshold=args.crosscheck_fuzzy_threshold,
+                    duplicate_policy=args.duplicate_policy,
+                )
+                duplicate_count = write_review_dispositions(duplicate_dispositions, duplicates_output)
+                LOGGER.info("Duplicate-card audit written: %s (%d rows)", duplicates_output, duplicate_count)
+                LOGGER.info("Cross-check retained %d cards for model review", len(cards))
             review_result = review_cards_ollama(
                 cards,
                 model=vocab_model,
@@ -1911,6 +2147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 rejected_output=rejected_output,
                 recover_needs_review=args.recover_needs_review,
                 card_format=args.card_format,
+                initial_needs_review=duplicate_dispositions,
             )
             cards = review_result.accepted
         count = write_cards(cards, args.output, card_format=args.card_format)
@@ -1920,6 +2157,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             LOGGER.info("Wrote %d validation findings to %s", validation_count, validation_output)
             LOGGER.info("Needs-review audit available at %s", needs_review_output)
             LOGGER.info("Rejected-card audit available at %s", rejected_output)
+            if args.crosscheck_anki:
+                duplicates_output = args.duplicates_output or suffixed_output_path(args.output, "duplicates")
+                LOGGER.info("Duplicate-card audit available at %s", duplicates_output)
     except Exception as exc:
         LOGGER.exception("Pipeline failed: %s", exc)
         return 1
