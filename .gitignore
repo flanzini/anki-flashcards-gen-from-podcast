@@ -19,3 +19,6 @@ logs/
 .env
 .venv/
 venv/
+
+# Local dry-run data for cloud/transcript_service
+cloud_data/

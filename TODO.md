@@ -82,6 +82,7 @@
 
 - [x] Add a command that reviews an existing CSV and writes a cleaned Anki-ready CSV.
 - [x] Add a no-model command that reformats a generated/reviewed CSV into split Anki import files.
+- [x] Add `--transcribe-only` to download/transcribe episodes without vocabulary extraction.
 - [ ] Add a short status command or helper that summarizes:
   - whether transcription exists
   - whether extraction completed
@@ -104,6 +105,22 @@
   - Review old sample/test CSVs and example files before moving or removing them.
   - Keep only files used by the current CLI workflow at the repository root.
 
+## Listening Support
+
+- [x] Phone on-demand transcript delivery service (code complete; GCP deploy on hold).
+  - Service lives under `cloud/transcript_service/`; deploy notes in `cloud/deploy.md`.
+  - Authenticated `POST /v1/transcripts` with RSS episode index or title search.
+  - Cache transcripts in GCS or local storage so repeat requests skip Speech-to-Text.
+  - **Preferred path without GCP credits:** weekend `--transcribe-only` batch runs +
+    OneDrive (or similar) sync of `transcripts/` to the phone.
+- [ ] Deploy transcript service to GCP when credits or billing are available again.
+- [ ] Self-hosted transcript service (home PC + faster-whisper + tunnel) as a no-GCP
+  on-demand alternative to Cloud Run.
+- [ ] Local audio + transcript viewer for side-by-side listening on the PC.
+- [ ] Timestamped / synced transcript export (SRT/VTT) for highlight-while-playing.
+- [ ] Optional in-browser download page (no email) for phone clients.
+- [ ] Optional Google Drive sync of local `transcripts/` as a non-cloud fallback.
+
 ## Cloud Execution
 
 - [ ] Support running the pipeline remotely instead of only on the local Windows machine.
@@ -117,9 +134,10 @@
 - [ ] Benchmark one representative episode on a candidate GCP VM and compare with local baseline.
   - Measure transcription, extraction, and review phases separately.
   - Record on-demand and Spot costs with runtime variance.
-- [ ] Add a remote queue/trigger path that can be started from mobile.
-  - Option A: webhook endpoint plus authenticated job enqueue.
-  - Option B: RSS polling trigger for new episodes.
+- [x] Add a remote queue/trigger path that can be started from mobile (transcript-only).
+  - Implemented: authenticated Cloud Run webhook plus optional Cloud Tasks worker enqueue.
+  - [ ] Option B later: RSS polling trigger for new episodes.
+  - [ ] Extend the same trigger pattern to full extract/review jobs when remote Anki processing is ready.
 - [ ] Add remote run status visibility suitable for mobile.
   - Expose per-episode stage (`transcribe`, `extract`, `review`, `validate`) and log tail.
 - [ ] Add a remote final-validation UX path for mobile browser use.

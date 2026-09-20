@@ -68,6 +68,30 @@ Find by title text:
 
 Downloaded audio is cached in `audio/`.
 
+## Transcribe Only (Weekend Batch Prep)
+
+Download and transcribe episodes without running vocabulary extraction or review.
+Useful when you want several transcripts ready before a later extract/review pass.
+
+Newest episode:
+
+```powershell
+& "C:\Users\filip\Miniconda3\condabin\conda.bat" run -n expenses python episode_to_anki.py --episode-index 0 --transcribe-only --log-file logs\transcribe_0.log
+```
+
+Batch several RSS episodes (newest first):
+
+```powershell
+foreach ($i in 0, 1, 2) {
+  & "C:\Users\filip\Miniconda3\condabin\conda.bat" run -n expenses python episode_to_anki.py `
+    --episode-index $i --transcribe-only --log-file "logs\transcribe_$i.log"
+}
+```
+
+Transcripts land in `transcripts/` and audio in `audio/`. Cached transcripts are
+reused on reruns unless you add `--force-transcribe`. Later, run the full pipeline
+with `--transcript-file` or the same RSS selection to skip retranscription.
+
 ## Useful Options
 
 Use a larger local LLM if you have enough memory:
@@ -386,6 +410,10 @@ updates.
 
 ## Cloud + Mobile Workflow Notes
 
+**Without GCP credits, the practical path is weekend batch prep:** run
+`--transcribe-only` for upcoming episodes, extract/review cards locally, push
+approved decks to Anki, and open synced transcripts on your phone while listening.
+
 Running in the cloud is mainly a convenience and automation upgrade: trigger
 jobs from mobile, keep a queue running while your laptop is offline, and keep
 logs/artifacts in one place. The current checkpointed pipeline already fits this
@@ -419,6 +447,49 @@ repeating completed batches:
 ```powershell
 python episode_to_anki.py --transcript-file transcript.txt --resume-input outputs\ulp_2_50\partial.csv --resume-after-batch 5 --output outputs\ulp_2_50\resumed.csv --batch-chars 1200 --cards-per-batch 6
 ```
+
+## On-Demand Transcript From Phone (Google Cloud, Optional)
+
+GCP deployment is **on hold** when free credits are unavailable. The code below
+is kept for future use; until then, use `--transcribe-only` batch prep above.
+
+For listening support away from the PC, a small Cloud Run service can transcribe
+an episode on demand and email a download link:
+
+```text
+Phone shortcut -> Cloud Run -> Speech-to-Text -> GCS cache -> email signed URL
+```
+
+This path is **transcript delivery only**. It does not run vocabulary extraction
+or Anki review. Local `faster-whisper` caching under `transcripts/` remains the
+offline Anki pipeline.
+
+Package: `cloud/transcript_service/`. Deploy steps: [`cloud/deploy.md`](cloud/deploy.md).
+
+Local dry run with mock speech (no GCP):
+
+```powershell
+cd cloud
+pip install -r requirements.txt
+$env:TRANSCRIPT_API_TOKEN="dev-token"
+$env:EMAIL_TO="you@example.com"
+$env:TRANSCRIPT_SPEECH_BACKEND="mock"
+$env:LOCAL_DATA_DIR="..\cloud_data"
+uvicorn transcript_service.app:app --reload --port 8080
+```
+
+Request the newest episode:
+
+```powershell
+Invoke-RestMethod -Method POST -Uri http://127.0.0.1:8080/v1/transcripts `
+  -Headers @{ Authorization = "Bearer dev-token" } `
+  -ContentType "application/json" `
+  -Body '{ "episode_index": 0 }'
+```
+
+Phone shortcut: `POST /v1/transcripts` with the same bearer token and body
+`{ "episode_index": 0 }` or `{ "title_search": "doctor" }`. Open the emailed
+signed URL when the job completes (or poll `GET /v1/jobs/{job_id}`).
 
 ## Optional OpenAI Mode
 

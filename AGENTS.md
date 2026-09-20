@@ -14,6 +14,10 @@ workflow and preserve expensive intermediate work.
   logs, extracted snapshots, and reviewed checkpoints after failures.
 - When changing output formats, provide a no-model reformat path so completed
   extraction or review work does not need to be repeated.
+- For commute listening without cloud hosting, prefer weekend batch prep:
+  `--transcribe-only` for several episodes, then extract/review separately before
+  the listening week. Sync `transcripts/` (and optional `audio/`) to the phone
+  via OneDrive or similar; push approved cards to Anki before listening.
 
 ## Local Model Safety
 
@@ -91,6 +95,23 @@ workflow and preserve expensive intermediate work.
   encode episode-specific vocabulary corrections into production logic.
 - Future deduplication should consider both exact matches and close variants
   from earlier sessions or existing Anki notes.
+
+## Cloud Transcript Delivery
+
+- `cloud/transcript_service/` is an optional phone-triggered transcript delivery
+  service (Cloud Run + Speech-to-Text + GCS + email). It is separate from the
+  local Anki extraction/review pipeline and **not required** for routine study.
+- **Default without GCP credits:** use local `--transcribe-only` batch prep and
+  phone sync of cached `transcripts/`. Treat GCP deployment as on hold until
+  credits or a self-hosted alternative (home tunnel + faster-whisper) is chosen.
+- The service supports local dry runs (`TRANSCRIPT_SPEECH_BACKEND=mock`,
+  `LOCAL_DATA_DIR`) without billing; production GCP steps live in
+  `cloud/deploy.md`.
+- Reuse RSS episode selection conventions from `podcast_to_anki.py`. Prefer cache
+  hits over re-transcription whether storage is GCS or local.
+- Never commit API tokens, SMTP passwords, or service-account keys. Document
+  secrets via environment variables / Secret Manager only.
+- Do not assume cloud transcripts have been human-reviewed for Anki import.
 
 ## Files And Organization
 

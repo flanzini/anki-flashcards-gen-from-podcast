@@ -1737,14 +1737,16 @@ def target_pattern(target: str) -> re.Pattern[str]:
     )
 
 
-def read_or_create_transcript(args: argparse.Namespace, episode: Optional[Episode]) -> tuple[str, str, str]:
+def read_or_create_transcript(
+    args: argparse.Namespace, episode: Optional[Episode]
+) -> tuple[str, str, str, Path]:
     if args.transcript_file:
         transcript_path = Path(args.transcript_file)
         episode_name = args.episode_name or transcript_path.stem
         LOGGER.info("Reading transcript file: %s", transcript_path)
         transcript = transcript_path.read_text(encoding="utf-8-sig")
         transcript = maybe_repair_mojibake(transcript, args.repair_mojibake)
-        return transcript, str(transcript_path), episode_name
+        return transcript, str(transcript_path), episode_name, transcript_path
 
     audio_path = Path(args.audio_file) if args.audio_file else None
     episode_name = args.episode_name or (episode.title if episode else "episode")
@@ -1766,7 +1768,7 @@ def read_or_create_transcript(args: argparse.Namespace, episode: Optional[Episod
         LOGGER.info("Using cached transcript: %s", transcript_path)
         transcript = transcript_path.read_text(encoding="utf-8-sig")
         transcript = maybe_repair_mojibake(transcript, args.repair_mojibake)
-        return transcript, source, episode_name
+        return transcript, source, episode_name, transcript_path
 
     LOGGER.info("Transcribing audio with %s: %s", args.transcriber, audio_path)
     transcript = transcribe_audio(
@@ -1779,7 +1781,7 @@ def read_or_create_transcript(args: argparse.Namespace, episode: Optional[Episod
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     transcript_path.write_text(transcript, encoding="utf-8")
     LOGGER.info("Transcript written: %s (%d chars)", transcript_path, len(transcript))
-    return transcript, source, episode_name
+    return transcript, source, episode_name, transcript_path
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1844,6 +1846,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--force-transcribe", action="store_true")
+    parser.add_argument(
+        "--transcribe-only",
+        action="store_true",
+        help="Download and transcribe audio only; skip vocabulary extraction and review.",
+    )
     parser.add_argument(
         "--repair-mojibake",
         choices=["auto", "always", "never"],
@@ -1985,6 +1992,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RuntimeError("--crosscheck-fuzzy-threshold must be between 0 and 1.")
             if not (args.review_input or args.review_cards):
                 raise RuntimeError("--crosscheck-anki currently supports review flows (--review-input or --review-cards).")
+        if args.transcribe_only:
+            if args.transcript_file:
+                raise RuntimeError(
+                    "--transcribe-only downloads or transcribes audio; use RSS selection or --audio-file instead of --transcript-file."
+                )
+            for flag_name, flag_label in (
+                ("format_input", "--format-input"),
+                ("validate_input", "--validate-input"),
+                ("evaluate_input", "--evaluate-input"),
+                ("review_input", "--review-input"),
+                ("resume_input", "--resume-input"),
+            ):
+                if getattr(args, flag_name):
+                    raise RuntimeError(f"--transcribe-only cannot be used with {flag_label}.")
+            if args.review_cards:
+                raise RuntimeError("--transcribe-only cannot be used with --review-cards.")
         if args.format_input:
             LOGGER.info("Reading cards for reformatting: %s", args.format_input)
             cards = read_cards_csv(args.format_input)
@@ -2070,8 +2093,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.transcriber == "openai" and args.transcription_model == DEFAULT_LOCAL_TRANSCRIPTION_MODEL:
             args.transcription_model = DEFAULT_TRANSCRIPTION_MODEL
 
-        transcript, source, episode_name = read_or_create_transcript(args, episode)
+        transcript, source, episode_name, transcript_path = read_or_create_transcript(args, episode)
         LOGGER.info("Transcript ready: %d chars", len(transcript))
+        if args.transcribe_only:
+            LOGGER.info("Transcribe-only mode; skipping vocabulary extraction.")
+            LOGGER.info("Transcript available at %s", transcript_path)
+            LOGGER.info("Elapsed: %.1fs", time.time() - started)
+            return 0
         vocab_model = args.ollama_model if args.vocab_provider == "ollama" else args.text_model
         initial_cards: List[VocabCard] = []
         if args.resume_input:
