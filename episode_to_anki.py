@@ -47,8 +47,12 @@ DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 DEFAULT_OLLAMA_TIMEOUT = 900
 DEFAULT_OLLAMA_NUM_PREDICT = 2048
 DEFAULT_OLLAMA_RETRIES = 2
+DEFAULT_OPENAI_TIMEOUT = 180
+DEFAULT_OPENAI_RETRIES = 2
 DEFAULT_BATCH_CHARS = 5000
 DEFAULT_CARDS_PER_BATCH = 10
+DEFAULT_REVIEW_BATCH_SIZE = 20
+DEFAULT_OPENAI_REVIEW_BATCH_SIZE = 60
 DEFAULT_ANKI_URL = "http://127.0.0.1:8765"
 
 LOGGER = logging.getLogger("episode_to_anki")
@@ -702,6 +706,262 @@ def request_ollama_review_json(
     raise RuntimeError(f"Ollama {pass_name} review did not return a result.")
 
 
+def request_openai_json(
+    *,
+    api_key: str,
+    model: str,
+    system: str,
+    user: str,
+    timeout: int,
+    retries: int,
+    pass_name: str,
+) -> str:
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "text": {"format": {"type": "json_object"}},
+    }
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"OpenAI {pass_name} timed out after {timeout}s. "
+                "Try a smaller --review-batch-size or increase --openai-timeout."
+            ) from exc
+        except urllib.error.HTTPError as exc:
+            message = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI {pass_name} failed: {message}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Could not reach OpenAI during {pass_name}.") from exc
+
+        try:
+            content = extract_response_text(data)
+            parse_json_object(content)
+            return content
+        except (ValueError, json.JSONDecodeError) as exc:
+            if attempt < retries:
+                LOGGER.warning(
+                    "OpenAI returned malformed %s JSON; retrying request (%d/%d)",
+                    pass_name,
+                    attempt + 1,
+                    retries,
+                )
+                continue
+            raise RuntimeError(f"OpenAI repeatedly returned malformed JSON during {pass_name}.") from exc
+    raise RuntimeError(f"OpenAI {pass_name} did not return a result.")
+
+
+def review_cards_openai(
+    cards: Sequence[VocabCard],
+    *,
+    model: str,
+    api_key: str,
+    timeout: int,
+    retries: int,
+    batch_size: int,
+    checkpoint_output: Optional[Path] = None,
+    needs_review_output: Optional[Path] = None,
+    rejected_output: Optional[Path] = None,
+    recover_needs_review: bool = False,
+    card_format: str = "fields",
+    initial_needs_review: Sequence[ReviewDisposition] = (),
+) -> ReviewResult:
+    """Single-pass OpenAI review: triage + lexical cleanup in one call per batch."""
+    if not cards:
+        return ReviewResult([], dedupe_dispositions(initial_needs_review), [])
+
+    accepted: List[VocabCard] = []
+    needs_review: List[ReviewDisposition] = list(initial_needs_review)
+    rejected: List[ReviewDisposition] = []
+    batches = [list(cards[index : index + batch_size]) for index in range(0, len(cards), batch_size)]
+    LOGGER.info(
+        "Reviewing %d vocabulary items in %d OpenAI batch(es) (combined triage+lexical pass)",
+        len(cards),
+        len(batches),
+    )
+
+    for index, batch in enumerate(batches, start=1):
+        LOGGER.info("Combined review batch %d/%d: %d cards", index, len(batches), len(batch))
+        content = request_openai_json(
+            api_key=api_key,
+            model=model,
+            system=(
+                "You create high-quality Anki vocabulary decisions for English-speaking "
+                "learners of Ukrainian. Return only valid JSON."
+            ),
+            user=build_combined_review_prompt(batch),
+            timeout=timeout,
+            retries=retries,
+            pass_name="combined review",
+        )
+        batch_result = review_decisions_from_json(content, batch, phase="lexical")
+
+        if recover_needs_review and batch_result.needs_review:
+            pending_cards = [item.card for item in batch_result.needs_review]
+            LOGGER.info("Recovery pass batch %d/%d: %d pending cards", index, len(batches), len(pending_cards))
+            recovery_content = request_openai_json(
+                api_key=api_key,
+                model=model,
+                system=(
+                    "You reconsider uncertain Ukrainian vocabulary cards for Anki. "
+                    "Return only valid JSON."
+                ),
+                user=build_recovery_prompt(batch_result.needs_review),
+                timeout=timeout,
+                retries=retries,
+                pass_name="recovery",
+            )
+            recovery = review_decisions_from_json(recovery_content, pending_cards, phase="lexical")
+            batch_result = ReviewResult(
+                accepted=batch_result.accepted + recovery.accepted,
+                needs_review=recovery.needs_review,
+                rejected=batch_result.rejected + recovery.rejected,
+            )
+
+        accepted.extend(batch_result.accepted)
+        needs_review.extend(batch_result.needs_review)
+        rejected.extend(batch_result.rejected)
+        accepted = dedupe_cards(accepted)
+        needs_review = dedupe_dispositions(needs_review)
+        rejected = dedupe_dispositions(rejected)
+        LOGGER.info(
+            "Review batch %d/%d complete: %d accepted, %d pending, %d rejected so far",
+            index,
+            len(batches),
+            len(accepted),
+            len(needs_review),
+            len(rejected),
+        )
+        if checkpoint_output:
+            count = write_cards(accepted, checkpoint_output, card_format=card_format)
+            LOGGER.info("Review checkpoint written: %s (%d rows)", checkpoint_output, count)
+            if card_format == "bidirectional-with-sentences":
+                fields_checkpoint = suffixed_output_path(checkpoint_output, "reviewed_checkpoint")
+                write_cards(accepted, fields_checkpoint, card_format="fields")
+                LOGGER.info("Fields review checkpoint written for resume: %s", fields_checkpoint)
+        if needs_review_output:
+            pending_count = write_review_dispositions(needs_review, needs_review_output)
+            LOGGER.info("Needs-review audit written: %s (%d rows)", needs_review_output, pending_count)
+        if rejected_output:
+            rejected_count = write_review_dispositions(rejected, rejected_output)
+            LOGGER.info("Rejected-card audit written: %s (%d rows)", rejected_output, rejected_count)
+
+    return ReviewResult(dedupe_cards(accepted), dedupe_dispositions(needs_review), dedupe_dispositions(rejected))
+
+
+def run_review_cards(
+    cards: Sequence[VocabCard],
+    *,
+    provider: str,
+    model: str,
+    ollama_url: str,
+    ollama_timeout: int,
+    ollama_num_predict: int,
+    ollama_retries: int,
+    openai_timeout: int,
+    openai_retries: int,
+    batch_size: int,
+    checkpoint_output: Optional[Path] = None,
+    needs_review_output: Optional[Path] = None,
+    rejected_output: Optional[Path] = None,
+    recover_needs_review: bool = False,
+    card_format: str = "fields",
+    initial_needs_review: Sequence[ReviewDisposition] = (),
+) -> ReviewResult:
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set OPENAI_API_KEY before using OpenAI review.")
+        return review_cards_openai(
+            cards,
+            model=model,
+            api_key=api_key,
+            timeout=openai_timeout,
+            retries=openai_retries,
+            batch_size=batch_size,
+            checkpoint_output=checkpoint_output,
+            needs_review_output=needs_review_output,
+            rejected_output=rejected_output,
+            recover_needs_review=recover_needs_review,
+            card_format=card_format,
+            initial_needs_review=initial_needs_review,
+        )
+    if provider == "ollama":
+        return review_cards_ollama(
+            cards,
+            model=model,
+            url=ollama_url,
+            timeout=ollama_timeout,
+            num_predict=ollama_num_predict,
+            retries=ollama_retries,
+            batch_size=batch_size,
+            checkpoint_output=checkpoint_output,
+            needs_review_output=needs_review_output,
+            rejected_output=rejected_output,
+            recover_needs_review=recover_needs_review,
+            card_format=card_format,
+            initial_needs_review=initial_needs_review,
+        )
+    raise ValueError(f"Unknown review provider: {provider}")
+
+
+def build_combined_review_prompt(cards: Sequence[VocabCard]) -> str:
+    payload = [
+        {
+            "id": index,
+            "ukrainian": card.ukrainian,
+            "english": card.english,
+            "example": card.example,
+        }
+        for index, card in enumerate(cards)
+    ]
+    return (
+        "You are reviewing candidate Ukrainian vocabulary cards for an English-speaking learner.\n"
+        "In a single pass, triage usefulness and clean lemma/translation/example_target fields.\n"
+        "Return only valid JSON in this exact shape:\n"
+        '{"cards":[{"id":0,"d":"a","u":"слово","en":"word","ex":"Це слово.","t":"слово",'
+        '"tc":"h","nc":"h","c":"h","r":"ok"}]}\n'
+        "Codes: d=a accept, d=e edit, d=n needs_review, d=x reject_high_confidence; "
+        "tc/nc/c=h high, m medium, l low.\n"
+        "Field rules:\n"
+        "- Always return concrete u/en values. On accept with no change, copy the input ukrainian/english/example.\n"
+        "- Never use ellipsis placeholders such as ... in any field.\n"
+        "- Use an empty string for ex or t only when clearing a weak example or when no safe sentence target exists.\n"
+        "- r must be a short English explanation (for example 'useful slang term' or 'outro phrase'). "
+        "Never put only a decision code (a/e/n/x) in r.\n\n"
+        "Triage:\n"
+        "- accept plausible useful vocabulary even if its example is missing, short, or unsuitable for a sentence card.\n"
+        "- a standalone word remains a valid vocabulary-only card when its example is only that word.\n"
+        "- reject_high_confidence only for clear noise: advertisements, outro/greeting material, URLs, "
+        "malformed artifacts, or non-Ukrainian transcript noise.\n"
+        "- reject grammar metalanguage when it is merely mentioned incidentally rather than taught.\n"
+        "- never reject a plausible food, daily-routine, action, or lesson vocabulary item merely because the example is weak.\n\n"
+        "Lexical cleanup:\n"
+        "- use dictionary forms when a base vocabulary item is being taught rather than a specific phrase.\n"
+        "- treat the incoming English gloss as unverified; correct it when context supports a better gloss.\n"
+        "- use needs_review instead of accepting an uncertain translation or normalization.\n"
+        "- example_target must be the exact inflected surface form in example that expresses the Ukrainian headword; "
+        "otherwise return an empty string.\n"
+        "- when the example is only the headword or another one-token fragment, retain the vocabulary card if sound "
+        "and return empty example and example_target.\n\n"
+        f"Candidate cards:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
 def build_selection_prompt(cards: Sequence[VocabCard]) -> str:
     payload = [
         {
@@ -786,6 +1046,33 @@ def build_recovery_prompt(cards: Sequence[ReviewDisposition]) -> str:
     )
 
 
+def is_placeholder_review_value(value: str) -> bool:
+    normalized = clean_text(value).casefold()
+    return normalized in {"...", "…", "null", "none", "n/a", "-", "—", "."}
+
+
+def review_text_field(row: dict, keys: Sequence[str], original: str, *, allow_clear: bool = False) -> str:
+    """Read an edited review field, ignoring prompt placeholders and falling back to original."""
+    for key in keys:
+        if key not in row:
+            continue
+        raw_value = row.get(key)
+        if raw_value is None:
+            if allow_clear:
+                return ""
+            continue
+        cleaned = clean_text(str(raw_value))
+        if is_placeholder_review_value(cleaned):
+            # Models often echo "..." from the schema example; treat as "unchanged".
+            continue
+        if cleaned == "":
+            if allow_clear:
+                return ""
+            continue
+        return cleaned
+    return clean_text(original)
+
+
 def review_decisions_from_json(
     content: str, original_cards: Sequence[VocabCard], *, phase: str
 ) -> ReviewResult:
@@ -806,7 +1093,10 @@ def review_decisions_from_json(
         responded_ids.add(card_id)
 
         decision = normalize_review_decision(row.get("d") or row.get("decision", ""))
-        reason = clean_text(str(row.get("r") or row.get("reason") or row.get("note") or "No reviewer reason supplied."))
+        reason = normalize_review_reason(
+            row.get("r") or row.get("reason") or row.get("note") or "",
+            decision,
+        )
         decision_confidence = normalize_review_confidence(row.get("c") or row.get("decision_confidence", ""))
         translation_confidence = normalize_review_confidence(row.get("tc") or row.get("translation_confidence", ""))
         normalization_confidence = normalize_review_confidence(row.get("nc") or row.get("normalization_confidence", ""))
@@ -814,30 +1104,55 @@ def review_decisions_from_json(
         if phase == "selection":
             candidate = original
         else:
-            ukrainian = clean_text(str(row.get("u") or row.get("ukrainian") or original.ukrainian))
-            english = clean_text(str(row.get("en") or row.get("english") or original.english))
-            example = clean_text(str(row.get("ex") or row.get("example") or ""))
-            note = clean_text(str(row.get("r") or row.get("reason") or row.get("note") or original.note))
-            example_target = clean_text(str(row.get("t") or row.get("example_target") or ""))
+            ukrainian = review_text_field(row, ("u", "ukrainian"), original.ukrainian)
+            english = review_text_field(row, ("en", "english"), original.english)
+            example = review_text_field(row, ("ex", "example"), original.example, allow_clear=True)
+            note = review_text_field(row, ("r", "reason", "note"), original.note, allow_clear=True)
+            example_target = review_text_field(row, ("t", "example_target"), original.example_target, allow_clear=True)
+            used_original_fields = (
+                ukrainian == clean_text(original.ukrainian) and english == clean_text(original.english)
+            )
             if not ukrainian or not english or not CYRILLIC_RE.search(ukrainian):
-                needs_review.append(
-                    disposition_for_card(original, "needs_review", "Reviewer returned an unusable lexical edit.")
-                )
-                continue
-            candidate = sanitize_reviewed_cards(
-                [
-                    VocabCard(
-                        ukrainian=ukrainian,
-                        english=english,
-                        example=example,
-                        tags=f"{original.tags} reviewed",
-                        source=original.source,
-                        episode=original.episode,
-                        note=note,
-                        example_target=example_target,
+                if CYRILLIC_RE.search(original.ukrainian) and clean_text(original.english):
+                    LOGGER.warning(
+                        "Falling back to original fields after unusable lexical edit for: %s",
+                        original.ukrainian,
                     )
-                ]
-            )[0]
+                    candidate = original
+                    if decision in {"accept", "edit", "keep"}:
+                        # Keep the accept/edit when the original card is still study-worthy.
+                        pass
+                    else:
+                        needs_review.append(
+                            disposition_for_card(
+                                original,
+                                "needs_review",
+                                "Reviewer returned an unusable lexical edit; original card retained for manual review.",
+                            )
+                        )
+                        continue
+                else:
+                    needs_review.append(
+                        disposition_for_card(original, "needs_review", "Reviewer returned an unusable lexical edit.")
+                    )
+                    continue
+            else:
+                candidate = sanitize_reviewed_cards(
+                    [
+                        VocabCard(
+                            ukrainian=ukrainian,
+                            english=english,
+                            example=example,
+                            tags=f"{original.tags} reviewed",
+                            source=original.source,
+                            episode=original.episode,
+                            note=note,
+                            example_target=example_target,
+                        )
+                    ]
+                )[0]
+                if used_original_fields and decision == "edit":
+                    decision = "accept"
 
         disposition = disposition_for_card(
             candidate,
@@ -870,11 +1185,16 @@ def review_decisions_from_json(
             if decision == "drop" or is_clear_high_confidence_rejection(reason):
                 rejected.append(disposition_for_card(candidate, "reject_high_confidence", reason, decision_confidence="high"))
             else:
+                soft_reason = (
+                    reason
+                    if "without a clear" in reason.casefold()
+                    else f"Rejection needs confirmation: {reason}"
+                )
                 needs_review.append(
                     disposition_for_card(
                         candidate,
                         "needs_review",
-                        f"Rejection needs confirmation: {reason}",
+                        soft_reason,
                         decision_confidence=decision_confidence,
                         translation_confidence=translation_confidence,
                         normalization_confidence=normalization_confidence,
@@ -941,6 +1261,40 @@ def normalize_review_decision(value: object) -> str:
 def normalize_review_confidence(value: object) -> str:
     value = clean_text(str(value)).casefold()
     return {"h": "high", "m": "medium", "l": "low"}.get(value, value)
+
+
+def normalize_review_reason(reason: object, decision: str) -> str:
+    """Replace empty or code-only reasons with a readable default note."""
+    text = clean_text(str(reason or ""))
+    code_only = text.casefold() in {
+        "",
+        "a",
+        "e",
+        "n",
+        "x",
+        "ok",
+        "accept",
+        "edit",
+        "needs_review",
+        "reject",
+        "reject_high_confidence",
+        "drop",
+    }
+    if text.casefold().startswith("rejection needs confirmation:"):
+        remainder = clean_text(text.split(":", 1)[-1])
+        if remainder.casefold() in {"", "x", "a", "e", "n", "reject", "reject_high_confidence", "drop"}:
+            return "Model proposed reject without a clear noise explanation."
+    if not code_only:
+        return text
+    defaults = {
+        "accept": "Accepted.",
+        "edit": "Edited during review.",
+        "keep": "Kept.",
+        "needs_review": "Model flagged for manual review (no detailed reason returned).",
+        "reject_high_confidence": "Model proposed reject without a clear noise explanation.",
+        "drop": "Model proposed drop without a clear noise explanation.",
+    }
+    return defaults.get(decision, "No reviewer reason supplied.")
 
 
 def is_clear_high_confidence_rejection(reason: str) -> bool:
@@ -1904,13 +2258,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--review-cards",
         action="store_true",
-        help="Run separate local LLM selection and lexical-cleanup passes before deterministic validation.",
+        help="Run LLM review before deterministic validation (Ollama multi-pass or OpenAI combined pass).",
     )
-    parser.add_argument("--review-batch-size", type=int, default=20, help="Cards per LLM review batch.")
+    parser.add_argument(
+        "--review-provider",
+        choices=["ollama", "openai"],
+        default=None,
+        help=(
+            "Provider for --review-cards / --review-input. Defaults to --vocab-provider when reviewing. "
+            "OpenAI uses a single combined triage+lexical pass with larger batches."
+        ),
+    )
+    parser.add_argument(
+        "--review-batch-size",
+        type=int,
+        default=None,
+        help=(
+            f"Cards per LLM review batch. Defaults to {DEFAULT_REVIEW_BATCH_SIZE} for Ollama "
+            f"and {DEFAULT_OPENAI_REVIEW_BATCH_SIZE} for OpenAI."
+        ),
+    )
     parser.add_argument(
         "--recover-needs-review",
         action="store_true",
         help="Run a focused additional LLM pass on cards held for manual review during lexical cleanup.",
+    )
+    parser.add_argument(
+        "--openai-timeout",
+        type=int,
+        default=int(os.environ.get("OPENAI_TIMEOUT", DEFAULT_OPENAI_TIMEOUT)),
+        help="Seconds to wait for each OpenAI extraction or review request.",
+    )
+    parser.add_argument(
+        "--openai-retries",
+        type=int,
+        default=int(os.environ.get("OPENAI_RETRIES", DEFAULT_OPENAI_RETRIES)),
+        help="Number of retries when OpenAI returns malformed JSON.",
     )
     parser.add_argument(
         "--crosscheck-anki",
@@ -1942,7 +2325,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--duplicate-policy",
         choices=["needs_review", "skip", "keep"],
         default="needs_review",
-        help="How to handle matched Anki duplicates during cross-check.",
+        help=(
+            "How to handle matched Anki duplicates during cross-check. "
+            "With OpenAI review + --crosscheck-anki, defaults to skip unless this flag is set explicitly."
+        ),
     )
     parser.add_argument("--text-model", default=os.environ.get("OPENAI_TEXT_MODEL", DEFAULT_TEXT_MODEL))
     parser.add_argument(
@@ -1953,6 +2339,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--log-file", type=Path, help="Optional log file path.")
     return parser
+
+
+def resolve_review_provider(args: argparse.Namespace) -> str:
+    if args.review_provider:
+        return args.review_provider
+    return args.vocab_provider
+
+
+def resolve_review_batch_size(args: argparse.Namespace, review_provider: str) -> int:
+    if args.review_batch_size is not None:
+        return args.review_batch_size
+    if review_provider == "openai":
+        return DEFAULT_OPENAI_REVIEW_BATCH_SIZE
+    return DEFAULT_REVIEW_BATCH_SIZE
+
+
+def resolve_duplicate_policy(args: argparse.Namespace, review_provider: str, argv: Optional[Sequence[str]]) -> str:
+    argv_list = list(argv if argv is not None else sys.argv[1:])
+    if (
+        review_provider == "openai"
+        and args.crosscheck_anki
+        and "--duplicate-policy" not in argv_list
+    ):
+        return "skip"
+    return args.duplicate_policy
+
+
+def review_model_for_provider(args: argparse.Namespace, review_provider: str) -> str:
+    if review_provider == "openai":
+        return args.text_model
+    return args.ollama_model
 
 
 def configure_logging(level: str, log_file: Optional[Path]) -> None:
@@ -1978,6 +2395,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     configure_logging(args.log_level, args.log_file)
     started = time.time()
+    review_provider = resolve_review_provider(args)
+    review_batch_size = resolve_review_batch_size(args, review_provider)
+    duplicate_policy = resolve_duplicate_policy(args, review_provider, argv)
+    review_model = review_model_for_provider(args, review_provider)
 
     try:
         LOGGER.info("Starting episode-to-Anki pipeline")
@@ -1992,6 +2413,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RuntimeError("--crosscheck-fuzzy-threshold must be between 0 and 1.")
             if not (args.review_input or args.review_cards):
                 raise RuntimeError("--crosscheck-anki currently supports review flows (--review-input or --review-cards).")
+            if duplicate_policy != args.duplicate_policy:
+                LOGGER.info(
+                    "OpenAI review with Anki cross-check: defaulting --duplicate-policy to %s",
+                    duplicate_policy,
+                )
         if args.transcribe_only:
             if args.transcript_file:
                 raise RuntimeError(
@@ -2030,12 +2456,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1 if failures else 0
 
         if args.review_input:
-            vocab_model = args.ollama_model if args.vocab_provider == "ollama" else args.text_model
             LOGGER.info("Reading cards for review: %s", args.review_input)
             cards = read_cards_csv(args.review_input)
-            LOGGER.info("Loaded %d vocabulary cards for review", len(cards))
-            if args.vocab_provider != "ollama":
-                raise RuntimeError("--review-input currently supports local Ollama review only.")
+            LOGGER.info("Loaded %d vocabulary cards for review via %s", len(cards), review_provider)
             rejected_output = args.rejected_output or suffixed_output_path(args.output, "rejected")
             needs_review_output = args.needs_review_output or suffixed_output_path(args.output, "needs_review")
             duplicate_dispositions: List[ReviewDisposition] = []
@@ -2047,19 +2470,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     deck=args.crosscheck_anki_deck,
                     url=args.crosscheck_anki_url,
                     fuzzy_threshold=args.crosscheck_fuzzy_threshold,
-                    duplicate_policy=args.duplicate_policy,
+                    duplicate_policy=duplicate_policy,
                 )
                 duplicate_count = write_review_dispositions(duplicate_dispositions, duplicates_output)
                 LOGGER.info("Duplicate-card audit written: %s (%d rows)", duplicates_output, duplicate_count)
                 LOGGER.info("Cross-check retained %d cards for model review", len(cards))
-            review_result = review_cards_ollama(
+            review_result = run_review_cards(
                 cards,
-                model=vocab_model,
-                url=args.ollama_url,
-                timeout=args.ollama_timeout,
-                num_predict=args.ollama_num_predict,
-                retries=args.ollama_retries,
-                batch_size=args.review_batch_size,
+                provider=review_provider,
+                model=review_model,
+                ollama_url=args.ollama_url,
+                ollama_timeout=args.ollama_timeout,
+                ollama_num_predict=args.ollama_num_predict,
+                ollama_retries=args.ollama_retries,
+                openai_timeout=args.openai_timeout,
+                openai_retries=args.openai_retries,
+                batch_size=review_batch_size,
                 checkpoint_output=args.output,
                 needs_review_output=needs_review_output,
                 rejected_output=rejected_output,
@@ -2141,8 +2567,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ollama_retries=args.ollama_retries,
             )
         if args.review_cards:
-            if args.vocab_provider != "ollama":
-                raise RuntimeError("--review-cards currently supports local Ollama review only.")
             extraction_snapshot = suffixed_output_path(args.output, "extracted")
             extracted_count = write_cards(cards, extraction_snapshot, card_format="fields")
             LOGGER.info("Extraction snapshot written before review: %s (%d cards)", extraction_snapshot, extracted_count)
@@ -2157,19 +2581,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     deck=args.crosscheck_anki_deck,
                     url=args.crosscheck_anki_url,
                     fuzzy_threshold=args.crosscheck_fuzzy_threshold,
-                    duplicate_policy=args.duplicate_policy,
+                    duplicate_policy=duplicate_policy,
                 )
                 duplicate_count = write_review_dispositions(duplicate_dispositions, duplicates_output)
                 LOGGER.info("Duplicate-card audit written: %s (%d rows)", duplicates_output, duplicate_count)
                 LOGGER.info("Cross-check retained %d cards for model review", len(cards))
-            review_result = review_cards_ollama(
+            review_result = run_review_cards(
                 cards,
-                model=vocab_model,
-                url=args.ollama_url,
-                timeout=args.ollama_timeout,
-                num_predict=args.ollama_num_predict,
-                retries=args.ollama_retries,
-                batch_size=args.review_batch_size,
+                provider=review_provider,
+                model=review_model,
+                ollama_url=args.ollama_url,
+                ollama_timeout=args.ollama_timeout,
+                ollama_num_predict=args.ollama_num_predict,
+                ollama_retries=args.ollama_retries,
+                openai_timeout=args.openai_timeout,
+                openai_retries=args.openai_retries,
+                batch_size=review_batch_size,
                 checkpoint_output=args.output,
                 needs_review_output=needs_review_output,
                 rejected_output=rejected_output,

@@ -32,6 +32,11 @@ workflow and preserve expensive intermediate work.
 - For routine local runs on this machine, default to `qwen3:4b` and conservative
   batch sizes (for example `--batch-chars 1200 --cards-per-batch 6
   --review-batch-size 4`).
+- When the user has OpenAI API credits, prefer `--vocab-provider openai` and
+  `--review-provider openai` with `gpt-4o-mini`: combined single-pass review,
+  default review batch size 60, and Anki `--duplicate-policy skip` when
+  `--crosscheck-anki` is set without an explicit policy. Do not assume a ChatGPT
+  subscription includes API credits.
 - If possible, schedule full-episode review runs after finishing other
   memory-heavy work. Treat this as the preferred reliability setting rather
   than trying to force hard memory caps.
@@ -88,6 +93,13 @@ workflow and preserve expensive intermediate work.
   card)` and sentence cards on `Basic`.
 - Remember that Anki displays deck names containing `::` as expandable parent
   and child decks; explain that behavior when selecting destination names.
+- Preferred Anki hierarchy for this learner setup:
+  `Ukrainian::Chapter 1 Book` (manual textbook cards), `Ukrainian::Podcast`,
+  and episode decks such as `Ukrainian::ULP 4-134`. For `--crosscheck-anki`,
+  default examples should use parent deck `Ukrainian` so nested decks are
+  included. Do not recommend the obsolete top-level names
+  `Chapter #1 Ukrainian Book` or `Ukrainian Podcast`, or the non-existent
+  `Ukrainian::ULP` path (matches zero notes).
 - Treat managed AnkiConnect tags as the safe update key. Do not claim that
   earlier manually imported notes will be automatically updated or deduplicated.
 - ULP 2-50 provides regression examples of semantic target mismatch and false

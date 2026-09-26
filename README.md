@@ -309,8 +309,12 @@ python episode_to_anki.py --review-input outputs\ulp_2_50\extracted.csv --output
 Optional Anki duplicate cross-check before review:
 
 ```powershell
-python episode_to_anki.py --review-input outputs\ulp_2_50\extracted.csv --output outputs\ulp_2_50\reviewed.csv --card-format bidirectional-with-sentences --review-batch-size 6 --crosscheck-anki --crosscheck-anki-deck "Ukrainian::ULP" --crosscheck-fuzzy-threshold 0.84 --ollama-timeout 900
+python episode_to_anki.py --review-input outputs\ulp_2_50\extracted.csv --output outputs\ulp_2_50\reviewed.csv --card-format bidirectional-with-sentences --review-batch-size 6 --crosscheck-anki --crosscheck-anki-deck "Ukrainian" --crosscheck-fuzzy-threshold 0.84 --ollama-timeout 900
 ```
+
+Use the parent deck name `Ukrainian` so AnkiConnect includes nested child decks
+(book, podcast, and episode decks). A non-existent path such as `Ukrainian::ULP`
+matches zero notes and silently skips deduplication.
 
 When enabled, cards that match existing Anki notes (exact or fuzzy front-text
 match) are moved to `*_needs_review.csv` with reason `duplicate_card` and match
@@ -395,10 +399,20 @@ Or enable the **Push Accepted to Anki** button when launching the review UI:
 python card_review_web.py --resume-session outputs\ulp_2_50\anki_vocab_ulp_2_50_v4_manual_review.csv --output outputs\ulp_2_50\approved\anki_vocab_ulp_2_50_v4_approved.csv --anki-deck "Ukrainian::ULP 2-50"
 ```
 
-Anki uses `::` to create nested decks. With `Ukrainian::ULP 2-50`, the deck
-screen shows a parent deck named `Ukrainian` with an expandable `+` control;
-click it to reveal the child `ULP 2-50`. For podcast-only grouping under an
-existing parent, use a name such as `Ukrainian Podcast::ULP 2-50` instead.
+Anki uses `::` to create nested decks. Recommended local layout for this project:
+
+```text
+Ukrainian
+  Ukrainian::Chapter 1 Book    # manual / textbook vocabulary
+  Ukrainian::Podcast           # earlier podcast imports
+  Ukrainian::ULP 2-50          # episode-specific approved exports
+  Ukrainian::ULP 4-134
+```
+
+With `Ukrainian::ULP 2-50`, the deck screen shows a parent deck named `Ukrainian`
+with an expandable `+` control; click it to reveal the child. For duplicate
+cross-check before review, prefer `--crosscheck-anki-deck "Ukrainian"` so all
+nested Ukrainian decks are included in one query.
 
 Pushed notes receive stable integration tags plus searchable episode,
 card-type, and source tags. Running the push again skips
@@ -493,7 +507,57 @@ signed URL when the job completes (or poll `GET /v1/jobs/{job_id}`).
 
 ## Optional OpenAI Mode
 
-OpenAI remains available if you want it later:
+OpenAI extraction and review are available when you have API credits
+(separate from a ChatGPT subscription). Prefer this when you want faster runs
+than local `qwen3:4b`.
+
+1. Add a few euros of prepaid credit at https://platform.openai.com/settings/organization/billing
+2. Create an API key and set it in PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY="sk-..."
+```
+
+Full extract + combined review (typically a handful of API calls, not dozens):
+
+```powershell
+& "C:\Users\filip\Miniconda3\condabin\conda.bat" run -n expenses python episode_to_anki.py `
+  --transcript-file transcripts\ULP_4-134.txt `
+  --episode-name "ULP 4-134" `
+  --vocab-provider openai `
+  --review-provider openai `
+  --review-cards `
+  --text-model gpt-4o-mini `
+  --batch-chars 4000 `
+  --cards-per-batch 12 `
+  --card-format bidirectional-with-sentences `
+  --crosscheck-anki `
+  --crosscheck-anki-deck "Ukrainian" `
+  --output outputs\ulp_4_134_openai\anki_vocab.csv `
+  --log-file logs\ulp_4_134_openai.log
+```
+
+Notes:
+
+- OpenAI review uses one combined triage+lexical pass (default batch size 60).
+- With `--review-provider openai` and `--crosscheck-anki`, matched Anki cards are
+  skipped by default unless you set `--duplicate-policy` explicitly.
+- Prefer `--crosscheck-anki-deck "Ukrainian"` so nested book/podcast/episode
+  decks are all included.
+- Re-review an existing extraction without re-extracting:
+
+```powershell
+python episode_to_anki.py `
+  --review-input outputs\ulp_4_134\anki_vocab_ulp_4_134_extracted.csv `
+  --review-provider openai `
+  --text-model gpt-4o-mini `
+  --crosscheck-anki `
+  --crosscheck-anki-deck "Ukrainian" `
+  --output outputs\ulp_4_134_openai\reviewed.csv `
+  --card-format bidirectional-with-sentences
+```
+
+Transcription-only via OpenAI Whisper (optional; local `faster-whisper` remains free):
 
 ```powershell
 $env:OPENAI_API_KEY="your_api_key_here"

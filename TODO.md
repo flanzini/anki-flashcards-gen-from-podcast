@@ -66,6 +66,10 @@
   - Send only the final candidate cards plus rejected-card audit for stronger linguistic judgment.
   - Evaluate adjudicated output against saved quality fixtures before import.
   - Keep this optional because API use is billed separately from ChatGPT Pro.
+- [x] Add OpenAI combined review path (`--review-provider openai`) with larger batches.
+  - Single triage+lexical pass instead of the local multi-pass design.
+  - With OpenAI review + `--crosscheck-anki`, default `--duplicate-policy` to `skip`.
+  - Document prepaid API credit setup (separate from ChatGPT subscription).
 
 ## Deduplication
 
@@ -74,6 +78,9 @@
   - [x] Cross-check generated cards against existing Anki notes before review and mark matches as `duplicate_card` for manual validation.
   - [x] Detect near-duplicates with fuzzy front-text matching and write a duplicate audit report with matched note metadata.
   - [x] Add configurable duplicate policy (`needs_review`, `skip`, `keep`) for cross-check behavior.
+  - [x] Reorganize local Anki Ukrainian decks under parent `Ukrainian` via AnkiConnect
+    (`Chapter 1 Book`, `Podcast`, episode decks) so `--crosscheck-anki-deck "Ukrainian"`
+    covers manual and podcast cards in one query.
   - [ ] Tune duplicate thresholds and matching rules against real backfill runs to reduce false positives.
   - Keep a configurable policy for whether to skip, replace, or enrich an existing card with a better example.
   - Log which new items were excluded and which existing card they matched.
