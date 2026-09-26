@@ -90,6 +90,13 @@
 - [x] Add a command that reviews an existing CSV and writes a cleaned Anki-ready CSV.
 - [x] Add a no-model command that reformats a generated/reviewed CSV into split Anki import files.
 - [x] Add `--transcribe-only` to download/transcribe episodes without vocabulary extraction.
+- [x] Add a local HTML pipeline dashboard (`pipeline_dashboard.py` +
+  `Launch ULP Dashboard.bat`) with tabs for transcribe, generate (Ollama/OpenAI),
+  and final card review/export/Anki push.
+- [x] Transcribe tab episode discovery: title search, RSS index range, and
+  paginated load-more (full feed, not only newest 40).
+- [x] Dashboard Transcribe engine choice (local faster-whisper vs OpenAI Whisper)
+  and Stop/cancel for queued or running jobs.
 - [ ] Add a short status command or helper that summarizes:
   - whether transcription exists
   - whether extraction completed

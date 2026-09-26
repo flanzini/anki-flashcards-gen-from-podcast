@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ULP Pipeline Dashboard</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>ULP Pipeline Dashboard</h1>
+      <p class="subtitle">Transcribe episodes, generate flashcards, then approve before Anki.</p>
+    </div>
+    <div class="status-panel" id="statusPanel">
+      <div id="ankiBadge" class="badge warn">Anki: checking…</div>
+      <div id="openaiBadge" class="badge">OpenAI key: …</div>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="transcribe" type="button">1. Transcribe</button>
+    <button class="tab" data-tab="generate" type="button">2. Generate</button>
+    <button class="tab" data-tab="review" type="button">3. Review</button>
+  </nav>
+
+  <p class="banner" id="banner" hidden></p>
+
+  <section class="panel active" id="panel-transcribe">
+    <div class="panel-head">
+      <div>
+        <h2>Download and transcribe</h2>
+        <p>Search by title (e.g. <code>4-135</code>), choose Local or OpenAI Whisper, then Transcribe. Stop long jobs from the Jobs panel.</p>
+      </div>
+      <div class="actions">
+        <label class="inline-label">Engine
+          <select id="transcribeEngine">
+            <option value="faster-whisper">Local faster-whisper (free, slow)</option>
+            <option value="openai">OpenAI Whisper API (~$0.12 / 20 min)</option>
+          </select>
+        </label>
+        <button type="button" class="primary" id="startTranscribe">Transcribe selected</button>
+      </div>
+    </div>
+    <form class="filters" id="episodeFilterForm">
+      <label>Title search
+        <input id="episodeSearch" type="search" placeholder="e.g. 4-135" autocomplete="off">
+      </label>
+      <label>Index from
+        <input id="indexFrom" type="number" min="0" placeholder="optional" style="width:100px">
+      </label>
+      <label>Index to
+        <input id="indexTo" type="number" min="0" placeholder="optional" style="width:100px">
+      </label>
+      <div class="actions" style="align-self:end">
+        <button type="submit" class="primary" id="refreshEpisodes">Search</button>
+        <button type="button" id="clearEpisodeFilters">Clear filters</button>
+      </div>
+    </form>
+    <div class="filter-status" id="episodeStatus" aria-live="polite">Ready.</div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>#</th>
+            <th>Episode</th>
+            <th>Published</th>
+            <th>Audio</th>
+            <th>Transcript</th>
+            <th>Pipeline</th>
+          </tr>
+        </thead>
+        <tbody id="episodeRows"></tbody>
+      </table>
+    </div>
+    <div class="actions" style="margin-top:10px">
+      <button type="button" id="loadMoreEpisodes" hidden>Load more</button>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-generate">
+    <div class="panel-head">
+      <div>
+        <h2>Generate flashcards</h2>
+        <p>Open Anki with AnkiConnect before starting. Cross-check uses deck <code>Ukrainian</code>.</p>
+      </div>
+      <button type="button" id="refreshTranscripts">Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Transcript</th>
+            <th>Stage</th>
+            <th>Provider</th>
+            <th>Push deck (later)</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="transcriptRows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-review">
+    <div class="panel-head">
+      <div>
+        <h2>Review and approve</h2>
+        <p>Inspect accepted / needs-review / rejected cards, then export or push to Anki.</p>
+      </div>
+      <div class="actions">
+        <select id="reviewEpisode"></select>
+        <input id="reviewDeck" type="text" placeholder="Ukrainian::ULP …" style="min-width:220px">
+        <button type="button" id="loadReview">Load</button>
+        <button type="button" id="saveReview">Save</button>
+        <button type="button" class="primary" id="exportReview">Export Accepted</button>
+        <button type="button" id="pushReview">Push to Anki</button>
+      </div>
+    </div>
+    <div class="review-toolbar">
+      <label>Show
+        <select id="reviewFilter">
+          <option>all</option>
+          <option>accept</option>
+          <option>needs_review</option>
+          <option>reject</option>
+        </select>
+      </label>
+      <span class="counts" id="reviewCounts"></span>
+      <span class="message" id="reviewMessage"></span>
+    </div>
+    <div class="review-layout">
+      <div class="review-list" id="reviewList"></div>
+      <div class="review-editor">
+        <div class="row">
+          <div class="field"><label>Ukrainian</label><input id="ukrainian" type="text"></div>
+          <div class="field"><label>English</label><input id="english" type="text"></div>
+        </div>
+        <div class="field"><label>Example</label><textarea id="example"></textarea></div>
+        <div class="field"><label>Example target</label><input id="target" type="text"></div>
+        <div class="row">
+          <div class="field"><label>Decision</label>
+            <select id="decision">
+              <option>accept</option>
+              <option>needs_review</option>
+              <option>reject</option>
+            </select>
+          </div>
+          <div class="field"><label>Source queue</label><input id="origin" type="text" readonly></div>
+        </div>
+        <div class="field"><label>Reviewer note</label><textarea id="reason"></textarea></div>
+        <div class="decisionbuttons">
+          <button type="button" id="acceptNext">Accept + Next</button>
+          <button type="button" id="needsNext">Needs Review + Next</button>
+          <button type="button" id="rejectNext">Reject + Next</button>
+        </div>
+        <div class="validation" id="validation">Load an episode to begin.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="jobs">
+    <div class="panel-head">
+      <h2>Jobs</h2>
+      <div class="actions">
+        <button type="button" id="cancelSelectedJob">Stop selected job</button>
+        <button type="button" id="refreshJobs">Refresh</button>
+      </div>
+    </div>
+    <div id="jobList" class="job-list"></div>
+    <pre id="jobLog" class="job-log" aria-live="polite"></pre>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

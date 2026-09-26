@@ -18,6 +18,15 @@ workflow and preserve expensive intermediate work.
   `--transcribe-only` for several episodes, then extract/review separately before
   the listening week. Sync `transcripts/` (and optional `audio/`) to the phone
   via OneDrive or similar; push approved cards to Anki before listening.
+- Prefer the local browser dashboard (`pipeline_dashboard.py` /
+  `Launch ULP Dashboard.bat`) for day-to-day orchestration: tab 1 transcribe,
+  tab 2 generate (Ollama or OpenAI), tab 3 review/export/push. Jobs must remain
+  thin wrappers over `episode_to_anki.py`; do not reimplement Whisper or review
+  prompts inside the dashboard. On the Transcribe tab, support title search,
+  RSS index ranges (0 = newest), and pagination so older episodes are reachable.
+  Offer local `faster-whisper` or OpenAI Whisper (`whisper-1`) as the transcribe
+  engine, and allow cancelling queued/running dashboard jobs (especially long
+  local transcriptions).
 
 ## Local Model Safety
 

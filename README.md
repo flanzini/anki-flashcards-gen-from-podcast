@@ -32,6 +32,27 @@ ollama pull qwen3:4b
 `qwen3:8b` can produce better translations, but it needs more memory. On this
 machine, `qwen3:4b` is the safer default.
 
+## Pipeline Dashboard (recommended UI)
+
+Double-click [`Launch ULP Dashboard.bat`](Launch%20ULP%20Dashboard.bat) (or run
+the command below). A browser opens at `http://127.0.0.1:8787/` with three tabs:
+
+1. **Transcribe** — search/filter RSS episodes, run local `faster-whisper` or
+   OpenAI Whisper API, and **Stop** queued/running jobs from the Jobs panel.
+2. **Generate** — choose Local (`qwen3:4b`) or OpenAI (`gpt-4o-mini`) flashcard
+   generation; keep Anki open (AnkiConnect) so duplicates can be checked against
+   parent deck `Ukrainian`
+3. **Review** — accept / edit / reject cards, export approved CSVs, push to Anki
+
+```powershell
+& "C:\Users\filip\Miniconda3\condabin\conda.bat" run -n expenses python pipeline_dashboard.py
+```
+
+Leave the launcher window open while using the dashboard. Stop with `Ctrl+C`.
+For OpenAI transcription or generation, put `OPENAI_API_KEY=...` in a local
+`.env` file in the repo root (gitignored), then relaunch the dashboard. The
+dashboard never writes the API key to disk itself.
+
 ## Local MP3 To Anki
 
 ```powershell
