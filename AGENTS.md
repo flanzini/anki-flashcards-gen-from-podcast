@@ -27,6 +27,11 @@ workflow and preserve expensive intermediate work.
   Offer local `faster-whisper` or OpenAI Whisper (`whisper-1`) as the transcribe
   engine, and allow cancelling queued/running dashboard jobs (especially long
   local transcriptions).
+- OpenAI review may optionally run `--synthesize-examples` after the combined
+  pass: invent a short natural Ukrainian sentence + exact `ExampleTarget` for
+  needs-review cards that lack a safe sentence example (e.g. “needs a relevant
+  example for clarity”). Keep filled cards in needs-review for human Accept;
+  do not silently import synthetic examples. Ollama must not use this path.
 
 ## Local Model Safety
 

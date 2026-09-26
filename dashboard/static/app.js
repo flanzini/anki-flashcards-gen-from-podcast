@@ -300,6 +300,7 @@ async function startGenerate(index) {
   const item = transcripts[index];
   const provider = $(`provider-${index}`).value;
   const anki_deck = $(`deck-${index}`).value.trim();
+  const synthesize_examples = provider === "openai" && $("synthesizeExamples").checked;
   try {
     const result = await request("/api/jobs/generate", "POST", {
       transcript_path: item.transcript_path,
@@ -307,6 +308,7 @@ async function startGenerate(index) {
       slug: item.slug,
       provider,
       anki_deck,
+      synthesize_examples,
     });
     await refreshJobs();
     if (result.job) selectJob(result.job.job_id);

@@ -563,6 +563,11 @@ Notes:
 - OpenAI review uses one combined triage+lexical pass (default batch size 60).
 - With `--review-provider openai` and `--crosscheck-anki`, matched Anki cards are
   skipped by default unless you set `--duplicate-policy` explicitly.
+- Optional `--synthesize-examples` (OpenAI only): after review, invent short natural
+  Ukrainian sentences for needs-review cards that lack a safe sentence target. Valid
+  fills stay in needs-review with reason `synthetic example ready for confirmation`
+  so you can Accept quickly. The dashboard Generate checkbox **Fill missing examples
+  (OpenAI)** turns this on (default checked for OpenAI).
 - Prefer `--crosscheck-anki-deck "Ukrainian"` so nested book/podcast/episode
   decks are all included.
 - Re-review an existing extraction without re-extracting:

@@ -516,6 +516,7 @@ def build_generate_command(
     slug: str,
     provider: str,
     log_path: Path,
+    synthesize_examples: bool = False,
 ) -> List[str]:
     output = output_dir_for(slug) / f"anki_vocab_{slug}.csv"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -554,6 +555,8 @@ def build_generate_command(
                 "12",
             ]
         )
+        if synthesize_examples:
+            cmd.append("--synthesize-examples")
     else:
         cmd.extend(
             [
@@ -834,12 +837,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     )
                 job_id = uuid.uuid4().hex[:10]
                 log_path = LOGS_DIR / f"dashboard_generate_{slug}_{job_id}.log"
+                synthesize_examples = bool(payload.get("synthesize_examples", provider == "openai"))
                 command = build_generate_command(
                     transcript_path=transcript,
                     episode_name=episode_name,
                     slug=slug,
                     provider=provider,
                     log_path=log_path,
+                    synthesize_examples=synthesize_examples,
                 )
                 job = JobRecord(
                     job_id=job_id,

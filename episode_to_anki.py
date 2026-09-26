@@ -777,6 +777,7 @@ def review_cards_openai(
     needs_review_output: Optional[Path] = None,
     rejected_output: Optional[Path] = None,
     recover_needs_review: bool = False,
+    synthesize_examples: bool = False,
     card_format: str = "fields",
     initial_needs_review: Sequence[ReviewDisposition] = (),
 ) -> ReviewResult:
@@ -860,6 +861,26 @@ def review_cards_openai(
             rejected_count = write_review_dispositions(rejected, rejected_output)
             LOGGER.info("Rejected-card audit written: %s (%d rows)", rejected_output, rejected_count)
 
+    if synthesize_examples and needs_review:
+        accepted, needs_review = synthesize_missing_examples_openai(
+            accepted,
+            needs_review,
+            model=model,
+            api_key=api_key,
+            timeout=timeout,
+            retries=retries,
+            batch_size=min(batch_size, 20),
+        )
+        accepted = dedupe_cards(accepted)
+        needs_review = dedupe_dispositions(needs_review)
+        if checkpoint_output:
+            write_cards(accepted, checkpoint_output, card_format=card_format)
+            if card_format == "bidirectional-with-sentences":
+                fields_checkpoint = suffixed_output_path(checkpoint_output, "reviewed_checkpoint")
+                write_cards(accepted, fields_checkpoint, card_format="fields")
+        if needs_review_output:
+            write_review_dispositions(needs_review, needs_review_output)
+
     return ReviewResult(dedupe_cards(accepted), dedupe_dispositions(needs_review), dedupe_dispositions(rejected))
 
 
@@ -879,6 +900,7 @@ def run_review_cards(
     needs_review_output: Optional[Path] = None,
     rejected_output: Optional[Path] = None,
     recover_needs_review: bool = False,
+    synthesize_examples: bool = False,
     card_format: str = "fields",
     initial_needs_review: Sequence[ReviewDisposition] = (),
 ) -> ReviewResult:
@@ -897,10 +919,13 @@ def run_review_cards(
             needs_review_output=needs_review_output,
             rejected_output=rejected_output,
             recover_needs_review=recover_needs_review,
+            synthesize_examples=synthesize_examples,
             card_format=card_format,
             initial_needs_review=initial_needs_review,
         )
     if provider == "ollama":
+        if synthesize_examples:
+            LOGGER.warning("--synthesize-examples is OpenAI-only; ignoring for Ollama review.")
         return review_cards_ollama(
             cards,
             model=model,
@@ -1044,6 +1069,153 @@ def build_recovery_prompt(cards: Sequence[ReviewDisposition]) -> str:
         "- reject_high_confidence only for clear noise, malformed text, or non-Ukrainian material.\n\n"
         f"Pending cards:\n{json.dumps(payload, ensure_ascii=False)}"
     )
+
+
+def card_has_safe_sentence_example(card: VocabCard) -> bool:
+    return bool(
+        card.example
+        and card.example_target
+        and CYRILLIC_RE.search(card.example)
+        and contains_exact_target(card.example, card.example_target)
+        and example_target_matches_headword(card.ukrainian, card.example_target)
+        and useful_sentence_context(card.example, card.example_target)
+    )
+
+
+def eligible_for_example_synthesis(item: ReviewDisposition) -> bool:
+    """Needs-review cards that still lack a safe fill-the-gap sentence example."""
+    return not card_has_safe_sentence_example(item.card)
+
+def build_synthesize_examples_prompt(cards: Sequence[ReviewDisposition]) -> str:
+    payload = [
+        {
+            "id": index,
+            "ukrainian": item.card.ukrainian,
+            "english": item.card.english,
+            "existing_example": item.card.example,
+            "previous_reason": item.reason,
+        }
+        for index, item in enumerate(cards)
+    ]
+    return (
+        "You write short natural Ukrainian example sentences for Anki vocabulary cards.\n"
+        "These cards were held for review mainly because a useful example was missing or too weak.\n"
+        "Return only valid JSON in this exact shape:\n"
+        '{"cards":[{"id":0,"ex":"Мені недостатньо часу.","t":"недостатньо","r":"ok"}]}\n'
+        "Rules:\n"
+        "- ex must be one natural Ukrainian sentence (or short clause) a learner might say or hear.\n"
+        "- t must be the exact surface form of the headword as it appears in ex (inflection allowed).\n"
+        "- Do not invent a different headword sense; keep the given English gloss.\n"
+        "- Prefer everyday wording; avoid dictionary metalanguage.\n"
+        "- If you cannot produce a safe sentence, return empty ex and t for that id.\n"
+        "- Keep r short.\n\n"
+        f"Cards:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def synthesize_missing_examples_openai(
+    accepted: Sequence[VocabCard],
+    needs_review: Sequence[ReviewDisposition],
+    *,
+    model: str,
+    api_key: str,
+    timeout: int,
+    retries: int,
+    batch_size: int,
+) -> tuple[List[VocabCard], List[ReviewDisposition]]:
+    """Optional OpenAI pass: invent safe examples for example-related needs_review cards."""
+    pending = [item for item in needs_review if eligible_for_example_synthesis(item)]
+    unchanged = [item for item in needs_review if not eligible_for_example_synthesis(item)]
+    if not pending:
+        return list(accepted), list(needs_review)
+
+    LOGGER.info(
+        "Synthesizing examples for %d needs-review card(s) lacking a safe sentence target",
+        len(pending),
+    )
+    accepted_out = list(accepted)
+    still_pending: List[ReviewDisposition] = list(unchanged)
+    batches = [pending[index : index + batch_size] for index in range(0, len(pending), batch_size)]
+
+    for batch_index, batch in enumerate(batches, start=1):
+        LOGGER.info(
+            "Example synthesis batch %d/%d: %d cards",
+            batch_index,
+            len(batches),
+            len(batch),
+        )
+        content = request_openai_json(
+            api_key=api_key,
+            model=model,
+            system=(
+                "You write natural Ukrainian example sentences for Anki cards. "
+                "Return only valid JSON."
+            ),
+            user=build_synthesize_examples_prompt(batch),
+            timeout=timeout,
+            retries=retries,
+            pass_name="example synthesis",
+        )
+        parsed = parse_json_object(content)
+        rows = parsed.get("cards", [])
+        by_id = {index: item for index, item in enumerate(batch)}
+        responded = set()
+
+        for row in rows:
+            try:
+                card_id = int(row.get("id"))
+                original_item = by_id[card_id]
+            except (TypeError, ValueError, KeyError):
+                continue
+            responded.add(card_id)
+            example = review_text_field(row, ("ex", "example"), original_item.card.example, allow_clear=True)
+            target = review_text_field(row, ("t", "example_target"), original_item.card.example_target, allow_clear=True)
+            note_bit = review_text_field(row, ("r", "reason", "note"), "", allow_clear=True)
+            prior_note = clean_text(original_item.card.note)
+            synth_note = "synthetic_example" + (f" ({note_bit})" if note_bit else "")
+            merged_note = f"{prior_note}; {synth_note}" if prior_note else synth_note
+            candidate = VocabCard(
+                ukrainian=original_item.card.ukrainian,
+                english=original_item.card.english,
+                example=example,
+                tags=original_item.card.tags,
+                source=original_item.card.source,
+                episode=original_item.card.episode,
+                note=merged_note,
+                example_target=target,
+            )
+            sanitized = sanitize_reviewed_cards([candidate])[0]
+            if card_has_safe_sentence_example(sanitized):
+                # Leave in needs_review with the filled example so a human can quickly Accept.
+                still_pending.append(
+                    disposition_for_card(
+                        sanitized,
+                        "needs_review",
+                        "synthetic example ready for confirmation",
+                        decision_confidence="medium",
+                        translation_confidence=original_item.translation_confidence,
+                        normalization_confidence=original_item.normalization_confidence,
+                    )
+                )
+            else:
+                still_pending.append(
+                    disposition_for_card(
+                        original_item.card,
+                        "needs_review",
+                        original_item.reason or "Could not synthesize a safe example sentence.",
+                        decision_confidence=original_item.decision_confidence,
+                        translation_confidence=original_item.translation_confidence,
+                        normalization_confidence=original_item.normalization_confidence,
+                    )
+                )
+
+        for index, item in enumerate(batch):
+            if index not in responded:
+                still_pending.append(item)
+
+    filled = sum(1 for item in still_pending if "synthetic example ready" in item.reason.casefold())
+    LOGGER.info("Example synthesis filled %d/%d eligible cards for manual confirmation", filled, len(pending))
+    return accepted_out, dedupe_dispositions(still_pending)
 
 
 def is_placeholder_review_value(value: str) -> bool:
@@ -2284,6 +2456,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run a focused additional LLM pass on cards held for manual review during lexical cleanup.",
     )
     parser.add_argument(
+        "--synthesize-examples",
+        action="store_true",
+        help=(
+            "OpenAI-only: after review, invent short natural Ukrainian example sentences for "
+            "needs-review cards that lack a safe sentence target. Filled examples stay in "
+            "needs-review for a quick human accept."
+        ),
+    )
+    parser.add_argument(
         "--openai-timeout",
         type=int,
         default=int(os.environ.get("OPENAI_TIMEOUT", DEFAULT_OPENAI_TIMEOUT)),
@@ -2490,6 +2671,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 needs_review_output=needs_review_output,
                 rejected_output=rejected_output,
                 recover_needs_review=args.recover_needs_review,
+                synthesize_examples=args.synthesize_examples,
                 card_format=args.card_format,
                 initial_needs_review=duplicate_dispositions,
             )
@@ -2601,6 +2783,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 needs_review_output=needs_review_output,
                 rejected_output=rejected_output,
                 recover_needs_review=args.recover_needs_review,
+                synthesize_examples=args.synthesize_examples,
                 card_format=args.card_format,
                 initial_needs_review=duplicate_dispositions,
             )

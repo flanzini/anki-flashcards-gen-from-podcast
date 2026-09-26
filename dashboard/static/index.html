@@ -85,7 +85,13 @@
         <h2>Generate flashcards</h2>
         <p>Open Anki with AnkiConnect before starting. Cross-check uses deck <code>Ukrainian</code>.</p>
       </div>
-      <button type="button" id="refreshTranscripts">Refresh</button>
+      <div class="actions">
+        <label class="inline-label" style="flex-direction:row;align-items:center;gap:8px">
+          <input id="synthesizeExamples" type="checkbox" checked>
+          Fill missing examples (OpenAI)
+        </label>
+        <button type="button" id="refreshTranscripts">Refresh</button>
+      </div>
     </div>
     <div class="table-wrap">
       <table>

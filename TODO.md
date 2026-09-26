@@ -97,6 +97,8 @@
   paginated load-more (full feed, not only newest 40).
 - [x] Dashboard Transcribe engine choice (local faster-whisper vs OpenAI Whisper)
   and Stop/cancel for queued or running jobs.
+- [x] Optional OpenAI `--synthesize-examples` pass to fill missing sentence
+  examples on needs-review cards (dashboard checkbox; stays pending for Accept).
 - [ ] Add a short status command or helper that summarizes:
   - whether transcription exists
   - whether extraction completed
