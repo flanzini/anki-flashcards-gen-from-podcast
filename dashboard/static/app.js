@@ -11,6 +11,12 @@ let selectedCard = 0;
 let selectedJobId = null;
 let logOffset = 0;
 let validateTimer = null;
+const completedJobSideEffects = new Set();
+let selectedReviewSlug = "";
+/** @type {Map<number, boolean>} */
+const episodeSelection = new Map();
+/** @type {Map<string, { provider: string, deck: string }>} */
+const generatePrefs = new Map();
 
 const $ = (id) => document.getElementById(id);
 
@@ -118,17 +124,18 @@ function renderEpisodes() {
     </td></tr>`;
   } else {
     $("episodeRows").innerHTML = episodes
-      .map(
-        (ep) => `<tr>
-      <td><input type="checkbox" data-index="${ep.index}" ${ep.has_transcript ? "" : "checked"}></td>
+      .map((ep) => {
+        const checked = episodeSelection.has(ep.index) ? episodeSelection.get(ep.index) : !ep.has_transcript;
+        return `<tr>
+      <td><input type="checkbox" data-index="${ep.index}" ${checked ? "checked" : ""}></td>
       <td>${ep.index}</td>
       <td><strong>${escapeHtml(ep.short_name)}</strong><br><small>${escapeHtml(ep.title)}</small></td>
       <td>${escapeHtml(ep.published || "")}</td>
       <td>${ep.has_audio ? '<span class="pill cached">cached</span>' : "—"}</td>
       <td>${ep.has_transcript ? '<span class="pill transcript">yes</span>' : "missing"}</td>
       <td>${stagePill(ep.stage)}</td>
-    </tr>`
-      )
+    </tr>`;
+      })
       .join("");
   }
   $("loadMoreEpisodes").hidden = !episodeHasMore;
@@ -213,22 +220,37 @@ async function clearEpisodeFilters() {
   await refreshEpisodes(true);
 }
 
+function captureGeneratePrefs() {
+  transcripts.forEach((item, index) => {
+    const provider = $(`provider-${index}`);
+    const deck = $(`deck-${index}`);
+    if (!provider && !deck) return;
+    generatePrefs.set(item.slug, {
+      provider: provider ? provider.value : "ollama",
+      deck: deck ? deck.value : item.default_deck || "",
+    });
+  });
+}
+
 async function refreshTranscripts() {
+  captureGeneratePrefs();
   const data = await request("/api/transcripts");
   transcripts = data.transcripts || [];
   $("transcriptRows").innerHTML = transcripts
     .map((item, i) => {
-      const openaiDisabled = "";
+      const prefs = generatePrefs.get(item.slug) || {};
+      const provider = prefs.provider || "ollama";
+      const deck = prefs.deck || item.default_deck || "";
       return `<tr>
       <td><strong>${escapeHtml(item.short_name)}</strong><br><small>${escapeHtml(item.transcript_path)}</small></td>
       <td>${stagePill(item.stage)}</td>
       <td>
-        <select id="provider-${i}">
-          <option value="ollama">Local qwen3:4b</option>
-          <option value="openai">OpenAI gpt-4o-mini</option>
+        <select id="provider-${i}" data-slug="${escapeHtml(item.slug)}">
+          <option value="ollama" ${provider === "ollama" ? "selected" : ""}>Local qwen3:4b</option>
+          <option value="openai" ${provider === "openai" ? "selected" : ""}>OpenAI gpt-4o-mini</option>
         </select>
       </td>
-      <td><input id="deck-${i}" type="text" value="${escapeHtml(item.default_deck)}"></td>
+      <td><input id="deck-${i}" data-slug="${escapeHtml(item.slug)}" type="text" value="${escapeHtml(deck)}"></td>
       <td><button type="button" data-generate="${i}">Generate</button>
           ${item.stage === "reviewed" || item.stage === "approved" ? `<button type="button" data-goto-review="${escapeHtml(item.slug)}">Review</button>` : ""}
       </td>
@@ -240,12 +262,27 @@ async function refreshTranscripts() {
 async function refreshReviewable() {
   const data = await request("/api/reviewable");
   reviewable = data.episodes || [];
+  const previous = selectedReviewSlug || $("reviewEpisode").value;
   $("reviewEpisode").innerHTML = reviewable
-    .map((item) => `<option value="${escapeHtml(item.slug)}">${escapeHtml(item.short_name)} (${escapeHtml(item.stage)})</option>`)
+    .map(
+      (item) =>
+        `<option value="${escapeHtml(item.slug)}">${escapeHtml(item.short_name)} (${escapeHtml(item.stage)})</option>`
+    )
     .join("");
-  if (reviewable.length) {
-    const current = reviewable.find((item) => item.slug === $("reviewEpisode").value) || reviewable[0];
-    $("reviewDeck").value = current.default_deck || "";
+  if (!reviewable.length) {
+    selectedReviewSlug = "";
+    return;
+  }
+  const current = reviewable.find((item) => item.slug === previous) || reviewable[0];
+  selectedReviewSlug = current.slug;
+  $("reviewEpisode").value = current.slug;
+  // Only sync the Anki deck field when it still matches the previous episode default
+  // or is empty — don't clobber a manual deck edit on background refresh.
+  const deckField = $("reviewDeck");
+  const previousItem = reviewable.find((item) => item.slug === previous);
+  const previousDefault = previousItem ? previousItem.default_deck || "" : "";
+  if (!deckField.value.trim() || deckField.value.trim() === previousDefault) {
+    deckField.value = current.default_deck || "";
   }
 }
 
@@ -333,7 +370,11 @@ async function refreshJobs() {
     </div>`;
     })
     .join("");
-  if (selectedJobId) await pollLog(false);
+  if (!selectedJobId) return;
+  const selected = jobs.find((job) => job.job_id === selectedJobId);
+  if (selected && (selected.status === "queued" || selected.status === "running")) {
+    await pollLog(false);
+  }
 }
 
 async function selectJob(jobId) {
@@ -353,10 +394,14 @@ async function pollLog(reset) {
   $("jobLog").scrollTop = $("jobLog").scrollHeight;
   if (data.job && (data.job.status === "queued" || data.job.status === "running")) {
     setTimeout(() => pollLog(false), 2000);
-  } else if (data.job && data.job.status === "done" && data.job.kind === "generate") {
+    return;
+  }
+  if (!data.job || completedJobSideEffects.has(selectedJobId)) return;
+  completedJobSideEffects.add(selectedJobId);
+  if (data.job.status === "done" && data.job.kind === "generate") {
     await refreshTranscripts();
     await refreshReviewable();
-  } else if (data.job && data.job.status === "done" && data.job.kind === "transcribe") {
+  } else if (data.job.status === "done" && data.job.kind === "transcribe") {
     await refreshEpisodes(true);
     await refreshTranscripts();
   }
@@ -448,6 +493,8 @@ async function loadReview(slug) {
     showBanner("No reviewed episode available yet.");
     return;
   }
+  selectedReviewSlug = target;
+  $("reviewEpisode").value = target;
   const data = await request("/api/review/load", "POST", {
     slug: target,
     anki_deck: $("reviewDeck").value.trim(),
@@ -492,6 +539,20 @@ function wireEvents() {
     refreshEpisodes(true).catch((error) => showBanner(error.message));
   });
   $("startTranscribe").addEventListener("click", () => startTranscribe().catch((error) => showBanner(error.message)));
+  $("episodeRows").addEventListener("change", (event) => {
+    const box = event.target.closest("input[type=checkbox][data-index]");
+    if (!box) return;
+    episodeSelection.set(Number(box.dataset.index), box.checked);
+  });
+  $("transcriptRows").addEventListener("change", (event) => {
+    const node = event.target.closest("[data-slug]");
+    if (!node || !node.dataset.slug) return;
+    const slug = node.dataset.slug;
+    const current = generatePrefs.get(slug) || { provider: "ollama", deck: "" };
+    if (node.tagName === "SELECT") current.provider = node.value;
+    if (node.tagName === "INPUT") current.deck = node.value;
+    generatePrefs.set(slug, current);
+  });
   $("cancelSelectedJob").addEventListener("click", () => {
     if (!selectedJobId) {
       showBanner("Select a job in the list first.");
@@ -519,7 +580,10 @@ function wireEvents() {
     }
     const go = event.target.closest("[data-goto-review]");
     if (go) {
+      selectedReviewSlug = go.dataset.gotoReview;
       $("reviewEpisode").value = go.dataset.gotoReview;
+      const item = reviewable.find((row) => row.slug === selectedReviewSlug);
+      if (item) $("reviewDeck").value = item.default_deck || "";
       loadReview(go.dataset.gotoReview).catch((error) => showBanner(error.message));
     }
   });
@@ -529,7 +593,8 @@ function wireEvents() {
   $("pushReview").addEventListener("click", () => persistReview("/api/review/push-anki").catch((error) => showBanner(error.message)));
   $("reviewFilter").addEventListener("change", renderReviewList);
   $("reviewEpisode").addEventListener("change", () => {
-    const item = reviewable.find((row) => row.slug === $("reviewEpisode").value);
+    selectedReviewSlug = $("reviewEpisode").value;
+    const item = reviewable.find((row) => row.slug === selectedReviewSlug);
     if (item) $("reviewDeck").value = item.default_deck || "";
   });
   $("reviewList").addEventListener("click", (event) => {
